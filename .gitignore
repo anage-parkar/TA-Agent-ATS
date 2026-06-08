@@ -1,0 +1,42 @@
+# Env
+.env
+.env.local
+.env*.local
+mcp-servers/**/.env
+
+# Python
+__pycache__/
+*.py[cod]
+.venv/
+venv/
+*.egg-info/
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+
+# Node / Next.js
+node_modules/
+.next/
+out/
+npm-debug.log*
+yarn-error.log*
+
+# Editors / OS
+.vscode/
+.idea/
+.DS_Store
+Thumbs.db
+
+# Docker volumes (named volume lives in docker, but ignore any local dumps)
+*.dump
+
+# Secrets / tokens
+*token*.json
+credentials.json
+secrets/
+*service-account*.json
+*-sa*.json
+# Google service-account keys (downloaded JSON)
+ta-project-*.json
+*serviceaccount*.json
+*.iam.gserviceaccount.com.json

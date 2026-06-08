@@ -1,0 +1,10 @@
+{
+  "mcpServers": {
+    "linkedin-jobs": {
+      "command": "python",
+      "args": [
+        "C:\\Users\\abhishek.nage\\TA Agent\\mcp-servers\\linkedin\\server.py"
+      ]
+    }
+  }
+}
