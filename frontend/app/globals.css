@@ -1,0 +1,37 @@
+@tailwind base;
+@tailwind components;
+@tailwind utilities;
+
+:root {
+  --background: #f8fafc; /* slate-50 */
+  --foreground: #0f172a; /* slate-900 */
+}
+
+html,
+body {
+  background: var(--background);
+  color: var(--foreground);
+}
+
+* {
+  -webkit-font-smoothing: antialiased;
+}
+
+/* Reusable building blocks for the light professional theme */
+@layer components {
+  .card {
+    @apply rounded-xl border border-slate-200 bg-white shadow-sm;
+  }
+  .btn-primary {
+    @apply rounded-lg bg-indigo-600 px-4 py-2 text-sm font-medium text-white transition hover:bg-indigo-700 disabled:opacity-50;
+  }
+  .btn-ghost {
+    @apply rounded-lg border border-slate-300 px-3 py-1.5 text-sm font-medium text-slate-700 transition hover:bg-slate-50 disabled:opacity-50;
+  }
+  .input {
+    @apply rounded-lg border border-slate-300 bg-white px-3 py-2 text-sm text-slate-900 placeholder-slate-400 outline-none focus:border-indigo-500 focus:ring-2 focus:ring-indigo-100;
+  }
+  .chip {
+    @apply rounded-full bg-slate-100 px-2 py-0.5 text-xs text-slate-600;
+  }
+}
