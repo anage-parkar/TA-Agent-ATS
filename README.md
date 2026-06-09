@@ -278,10 +278,8 @@ Human-in-the-loop gates are never bypassed — no email is sent without
 recruiter approval.
 Outreach emails will include a GDPR opt-out link (build step 8).
 
-<<<<<<< HEAD
 # TA-Agent-ATS
 Full-stack AI application that automates the end-to-end hiring workflow: ingest a LinkedIn job post, source and score candidates, review them with a human in the loop, draft and send outreach, parse replies, and schedule interviews
-=======
 # TA Agent — Agentic Talent Acquisition System
 
 A local-first, full-stack AI application that automates the end-to-end hiring
@@ -556,4 +554,3 @@ See `mcp-servers/linkedin/README.md` for the LinkedIn side.
 - LinkedIn scraping throttles to ≥3s between requests.
 - ATS score breakdowns are always stored and shown — no black-box scores.
 ```
->>>>>>> master
