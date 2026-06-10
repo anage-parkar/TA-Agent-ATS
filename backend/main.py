@@ -16,7 +16,7 @@ from fastapi.middleware.cors import CORSMiddleware
 from fastapi.staticfiles import StaticFiles
 
 from db.supabase_client import close_pool, db_available
-from routers import applications, candidates, dashboard, emails, jobs, sourcing, website
+from routers import applications, candidates, dashboard, emails, jobs, jd_generation, sourcing, website
 from services.llm_client import CLAUDE_BIN, cli_available
 
 logging.basicConfig(level=logging.INFO, format="%(levelname)s %(name)s: %(message)s")
@@ -64,10 +64,12 @@ app.include_router(sourcing.router)
 app.include_router(dashboard.router)
 app.include_router(website.router)
 app.include_router(emails.router)
+app.include_router(jd_generation.router)
 
-# Serve uploaded resumes (offsite-apply submissions).
+# Serve uploaded files (resumes + generated JD PDFs).
 _uploads = Path(__file__).resolve().parent / "uploads"
 _uploads.mkdir(parents=True, exist_ok=True)
+(_uploads / "jds").mkdir(parents=True, exist_ok=True)
 app.mount("/uploads", StaticFiles(directory=str(_uploads)), name="uploads")
 
 

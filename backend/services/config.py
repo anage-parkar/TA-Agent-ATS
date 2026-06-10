@@ -1,8 +1,13 @@
 """Central configuration loaded from environment / .env.local / .env.
 
-Env files are resolved by ABSOLUTE path to the repo root, so the values load
-no matter what working directory the backend is started from (uvicorn is
-typically launched from backend/, but .env lives at the repo root).
+Env files are resolved by ABSOLUTE path so values load no matter what working
+directory the backend is started from. We search in two locations:
+  1. repo root  (TA-Agent-ATS/.env  and  TA-Agent-ATS/.env.local)
+  2. backend/   (backend/.env       and  backend/.env.local)
+
+Files listed later in the tuple win, so backend/.env.local has the highest
+priority. This lets the project work whether .env sits at the repo root or
+inside backend/ (the current layout keeps it in backend/).
 """
 
 from __future__ import annotations
@@ -11,14 +16,18 @@ from pathlib import Path
 
 from pydantic_settings import BaseSettings, SettingsConfigDict
 
-# backend/services/config.py -> repo root is three parents up.
-_ROOT = Path(__file__).resolve().parents[2]
+_BACKEND = Path(__file__).resolve().parents[1]   # …/backend
+_ROOT    = Path(__file__).resolve().parents[2]   # …/TA-Agent-ATS
 
 
 class Settings(BaseSettings):
     model_config = SettingsConfigDict(
-        # .env.local wins over .env when both exist.
-        env_file=(str(_ROOT / ".env"), str(_ROOT / ".env.local")),
+        env_file=(
+            str(_ROOT    / ".env"),
+            str(_ROOT    / ".env.local"),
+            str(_BACKEND / ".env"),
+            str(_BACKEND / ".env.local"),
+        ),
         env_file_encoding="utf-8",
         extra="ignore",
     )

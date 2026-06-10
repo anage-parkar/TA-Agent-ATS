@@ -14,6 +14,7 @@ const META: Record<string, { icon: string; accent: string }> = {
 export default function DashboardPage() {
   const [channels, setChannels] = useState<ChannelSummary[]>([]);
   const [jobs, setJobs] = useState<number>(0);
+  const [jdCount, setJdCount] = useState<number>(0);
 
   useEffect(() => {
     api
@@ -22,6 +23,11 @@ export default function DashboardPage() {
         setChannels(d.channels);
         setJobs(d.jobs);
       })
+      .catch(() => {});
+
+    api
+      .listJDs()
+      .then((d) => setJdCount(d.count))
       .catch(() => {});
   }, []);
 
@@ -60,6 +66,33 @@ export default function DashboardPage() {
             </Link>
           );
         })}
+      </div>
+
+      {/* JD Generation card */}
+      <div className="mt-8">
+        <h2 className="mb-4 text-lg font-semibold text-slate-800">AI Tools</h2>
+        <div className="grid grid-cols-1 gap-5 sm:grid-cols-3">
+          <Link
+            href="/ai-jd"
+            className="group rounded-2xl border border-slate-200 bg-white p-6 shadow-sm transition hover:-translate-y-0.5 hover:border-indigo-300 hover:shadow-md"
+          >
+            <div className="flex items-center justify-between">
+              <span className="grid h-11 w-11 place-items-center rounded-xl bg-indigo-50 text-lg font-semibold text-indigo-700 ring-4 ring-indigo-100">
+                ✦
+              </span>
+              <span className="text-3xl font-bold text-slate-900">{jdCount}</span>
+            </div>
+            <h2 className="mt-4 font-semibold text-slate-900 group-hover:text-indigo-700">
+              JD Generation
+            </h2>
+            <p className="mt-1 text-sm text-slate-500">
+              AI-powered job descriptions tailored by role, skills, and seniority level
+            </p>
+            <p className="mt-4 text-sm font-medium text-indigo-600">
+              Generate JD →
+            </p>
+          </Link>
+        </div>
       </div>
 
       <div className="mt-8 rounded-xl border border-slate-200 bg-white p-5 text-sm text-slate-500 shadow-sm">

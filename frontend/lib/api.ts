@@ -75,6 +75,43 @@ export interface ApplicationRow {
   job_id?: string;
 }
 
+// ── JD Generation types ─────────────────────────────────────────────
+export interface JDContent {
+  title: string;
+  summary: string;
+  responsibilities: string[];
+  required_skills: string[];
+  nice_to_have: string[];
+  qualifications: string[];
+  what_we_offer: string[];
+}
+
+export interface GeneratedJD {
+  jd_id: string;
+  business_unit: string;
+  role: string;
+  designation: string;
+  years_of_experience: number;
+  skills: string[];
+  content: JDContent;
+  pdf_url: string | null;
+  created_at: string;
+}
+
+export interface JDMetadata {
+  business_units: Record<string, string[]>;
+  skills_by_role: Record<string, string[]>;
+  designation_map: Record<string, string[]>;
+}
+
+export interface JDGenerationRequest {
+  business_unit: string;
+  role: string;
+  skills: string[];
+  years_of_experience: number;
+  designation: string;
+}
+
 export interface ChannelSummary {
   channel: string;
   label: string;
@@ -217,4 +254,24 @@ export const api = {
       `/api/candidates/${candidate_id}/enrich`,
       { method: "POST" }
     ),
+
+  // ── JD Generation ─────────────────────────────────────────────────
+  jdMetadata: () => request<JDMetadata>("/api/jd/metadata"),
+
+  jdDesignations: (years: number) =>
+    request<{ years: number; designations: string[] }>(
+      `/api/jd/designations?years=${years}`
+    ),
+
+  listJDs: () => request<{ jds: GeneratedJD[]; count: number }>("/api/jd"),
+
+  getJD: (jd_id: string) => request<GeneratedJD>(`/api/jd/${encodeURIComponent(jd_id)}`),
+
+  generateJD: (req: JDGenerationRequest) =>
+    request<GeneratedJD>("/api/jd/generate", {
+      method: "POST",
+      body: JSON.stringify(req),
+    }),
+
+  jdDownloadUrl: (jd_id: string) => `${BASE}/api/jd/${encodeURIComponent(jd_id)}/download`,
 };

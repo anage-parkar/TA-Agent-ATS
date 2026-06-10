@@ -18,6 +18,7 @@ _jobs: dict[str, dict] = {}
 _candidates: dict[str, dict] = {}
 _applications: dict[str, dict] = {}
 _emails: dict[str, dict] = {}
+_generated_jds: dict[str, dict] = {}
 
 
 def _now() -> str:
@@ -545,6 +546,78 @@ def reply_already_recorded(thread_id: str) -> bool:
             (thread_id,),
         )
         return cur.fetchone() is not None
+
+
+# ── Generated JDs ─────────────────────────────────────────────────────
+def create_generated_jd(data: dict[str, Any]) -> dict:
+    """Persist a generated JD (content + optional PDF base64) and return it."""
+    if not db_available():
+        jd = {
+            "id": data["id"],
+            "business_unit": data["business_unit"],
+            "role": data["role"],
+            "designation": data["designation"],
+            "years_of_experience": data["years_of_experience"],
+            "skills": data.get("skills", []),
+            "content": data.get("content", {}),
+            "pdf_base64": data.get("pdf_base64"),
+            "pdf_url": data.get("pdf_url"),
+            "created_at": data.get("created_at", _now()),
+        }
+        _generated_jds[jd["id"]] = jd
+        return jd
+
+    import json as _json
+
+    with get_pool().connection() as conn:
+        cur = conn.execute(
+            """
+            insert into generated_jds
+              (id, business_unit, role, designation, years_of_experience,
+               skills, content, pdf_base64, pdf_url, created_at)
+            values
+              (%(id)s, %(business_unit)s, %(role)s, %(designation)s,
+               %(years_of_experience)s, %(skills)s, %(content)s,
+               %(pdf_base64)s, %(pdf_url)s, %(created_at)s)
+            returning *
+            """,
+            {
+                "id": data["id"],
+                "business_unit": data["business_unit"],
+                "role": data["role"],
+                "designation": data["designation"],
+                "years_of_experience": data["years_of_experience"],
+                "skills": _json.dumps(data.get("skills", [])),
+                "content": _json.dumps(data.get("content", {})),
+                "pdf_base64": data.get("pdf_base64"),
+                "pdf_url": data.get("pdf_url"),
+                "created_at": data.get("created_at", _now()),
+            },
+        )
+        return _row(cur)
+
+
+def list_generated_jds() -> list[dict]:
+    """Return all generated JDs newest-first."""
+    if not db_available():
+        return sorted(_generated_jds.values(), key=lambda j: j["created_at"], reverse=True)
+
+    with get_pool().connection() as conn:
+        cur = conn.execute(
+            "select * from generated_jds order by created_at desc"
+        )
+        return _rows(cur)
+
+
+def get_generated_jd(jd_id: str) -> Optional[dict]:
+    if not db_available():
+        return _generated_jds.get(jd_id)
+
+    with get_pool().connection() as conn:
+        cur = conn.execute(
+            "select * from generated_jds where id = %s", (jd_id,)
+        )
+        return _row(cur)
 
 
 def update_application(app_id: str, fields: dict[str, Any]) -> Optional[dict]:
