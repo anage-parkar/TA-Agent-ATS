@@ -449,7 +449,7 @@ function JDCard({
           <p className="mt-0.5 text-xs text-slate-500">{date}</p>
         </div>
         <div className="flex items-center gap-2 shrink-0">
-          {jd.pdf_url ? (
+          {jd.pdf_url && (
             <a
               href={api.jdDownloadUrl(jd.jd_id)}
               target="_blank"
@@ -458,14 +458,13 @@ function JDCard({
             >
               ↓ PDF
             </a>
-          ) : (
-            <button
-              onClick={() => onReopen(jd)}
-              className="rounded-lg border border-amber-200 bg-amber-50 px-3 py-1.5 text-xs font-medium text-amber-700 hover:bg-amber-100 transition"
-            >
-              ✎ Review
-            </button>
           )}
+          <button
+            onClick={() => onReopen(jd)}
+            className="rounded-lg border border-slate-200 bg-white px-3 py-1.5 text-xs font-medium text-slate-600 hover:bg-slate-50 transition"
+          >
+            ✎ Edit
+          </button>
           <button
             onClick={() => setExpanded((v) => !v)}
             className="rounded-lg border border-slate-200 px-3 py-1.5 text-xs font-medium text-slate-600 hover:bg-slate-50 transition"
@@ -502,6 +501,18 @@ function JDCard({
           {jd.content.what_we_offer.length > 0 && (
             <ReviewSection label="What We Offer" isEditing={false} items={jd.content.what_we_offer} />
           )}
+          {/* Edit CTA at the bottom of preview */}
+          <div className="flex items-center justify-between border-t border-slate-200 pt-4">
+            <p className="text-xs text-slate-400">
+              Want to make changes? Open the editor to modify any section.
+            </p>
+            <button
+              onClick={() => onReopen(jd)}
+              className="flex items-center gap-1.5 rounded-lg bg-indigo-600 px-4 py-2 text-xs font-semibold text-white hover:bg-indigo-700 transition"
+            >
+              ✎ Edit this JD
+            </button>
+          </div>
         </div>
       )}
     </div>
