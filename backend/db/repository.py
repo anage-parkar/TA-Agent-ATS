@@ -620,6 +620,35 @@ def get_generated_jd(jd_id: str) -> Optional[dict]:
         return _row(cur)
 
 
+def update_generated_jd(jd_id: str, fields: dict[str, Any]) -> Optional[dict]:
+    """Partially update a generated JD (content edits, pdf_base64, pdf_url, etc.)."""
+    import json as _json
+
+    if not db_available():
+        row = _generated_jds.get(jd_id)
+        if not row:
+            return None
+        for k, v in fields.items():
+            row[k] = v
+        return row
+
+    # Serialise any dict/list fields to JSON strings for the jsonb columns
+    db_fields: dict[str, Any] = {}
+    for k, v in fields.items():
+        if isinstance(v, (dict, list)):
+            db_fields[k] = _json.dumps(v)
+        else:
+            db_fields[k] = v
+
+    set_clause = ", ".join(f"{k} = %({k})s" for k in db_fields)
+    with get_pool().connection() as conn:
+        cur = conn.execute(
+            f"update generated_jds set {set_clause} where id = %(id)s returning *",
+            {**db_fields, "id": jd_id},
+        )
+        return _row(cur)
+
+
 def update_application(app_id: str, fields: dict[str, Any]) -> Optional[dict]:
     if not db_available():
         app = _applications.get(app_id)

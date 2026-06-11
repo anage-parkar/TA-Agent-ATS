@@ -273,5 +273,17 @@ export const api = {
       body: JSON.stringify(req),
     }),
 
+  updateJDContent: (jd_id: string, content: JDContent) =>
+    request<GeneratedJD>(`/api/jd/${encodeURIComponent(jd_id)}`, {
+      method: "PATCH",
+      body: JSON.stringify({ content }),
+    }),
+
+  generateJDPdf: (jd_id: string) =>
+    request<{ jd_id: string; pdf_url: string }>(
+      `/api/jd/${encodeURIComponent(jd_id)}/generate-pdf`,
+      { method: "POST" }
+    ),
+
   jdDownloadUrl: (jd_id: string) => `${BASE}/api/jd/${encodeURIComponent(jd_id)}/download`,
 };

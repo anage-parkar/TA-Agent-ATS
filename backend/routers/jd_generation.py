@@ -13,8 +13,9 @@ from fastapi import APIRouter, HTTPException
 from fastapi.responses import FileResponse
 
 from agents.jd_generator import generate_jd
-from db.repository import create_generated_jd, get_generated_jd, list_generated_jds
+from db.repository import create_generated_jd, get_generated_jd, list_generated_jds, update_generated_jd
 from models.jd_generation import GeneratedJD, JDContent, JDGenerationRequest
+from pydantic import BaseModel
 from services.llm_client import LLMError
 
 logger = logging.getLogger("ta_agent.routers.jd_generation")
@@ -367,7 +368,11 @@ def get_jd(jd_id: str):
 
 @router.post("/api/jd/generate")
 def generate_jd_endpoint(req: JDGenerationRequest):
-    """Generate a JD with AI, render a PDF, persist everything to Supabase, and return it."""
+    """Generate JD content via AI and save as a draft (no PDF yet).
+
+    The TA reviewer must inspect and optionally edit the content before
+    calling POST /api/jd/{id}/generate-pdf to produce the final document.
+    """
     bu_roles = BUSINESS_UNITS.get(req.business_unit)
     if not bu_roles:
         raise HTTPException(
@@ -390,7 +395,7 @@ def generate_jd_endpoint(req: JDGenerationRequest):
                    f"Allowed: {allowed}",
         )
 
-    # ── Generate JD content via LLM ───────────────────────────────────
+    # ── Generate JD content via LLM (no PDF at this stage) ────────────
     try:
         content: JDContent = generate_jd(req)
     except LLMError as exc:
@@ -400,36 +405,7 @@ def generate_jd_endpoint(req: JDGenerationRequest):
     jd_id = str(uuid.uuid4())
     now = datetime.now(timezone.utc).isoformat()
 
-    # ── Generate PDF and encode as base64 ─────────────────────────────
-    uploads_dir = Path(__file__).resolve().parent.parent / "uploads" / "jds"
-    pdf_url: str | None = None
-    pdf_base64: str | None = None
-
-    jd_obj = GeneratedJD(
-        jd_id=jd_id,
-        business_unit=req.business_unit,
-        role=req.role,
-        designation=req.designation,
-        years_of_experience=req.years_of_experience,
-        skills=req.skills,
-        content=content,
-        pdf_url=None,
-        created_at=now,
-    )
-
-    try:
-        from services.pdf_generator import generate_jd_pdf
-
-        pdf_path = generate_jd_pdf(jd_obj, uploads_dir)
-        pdf_url = f"/uploads/jds/{jd_id}.pdf"
-        pdf_base64 = base64.b64encode(pdf_path.read_bytes()).decode("utf-8")
-        logger.info("PDF generated and encoded: %s (%d bytes)", pdf_path.name, pdf_path.stat().st_size)
-    except Exception as exc:
-        logger.warning("PDF generation failed (JD still saved without PDF): %s", exc)
-
-    jd_obj.pdf_url = pdf_url
-
-    # ── Persist to Supabase (falls back to in-memory if DB unavailable) ──
+    # ── Persist draft to Supabase (pdf_url / pdf_base64 are NULL) ─────
     try:
         create_generated_jd({
             "id": jd_id,
@@ -439,36 +415,121 @@ def generate_jd_endpoint(req: JDGenerationRequest):
             "years_of_experience": req.years_of_experience,
             "skills": req.skills,
             "content": content.model_dump(),
-            "pdf_base64": pdf_base64,
-            "pdf_url": pdf_url,
+            "pdf_base64": None,
+            "pdf_url": None,
             "created_at": now,
         })
         logger.info(
-            "JD persisted: id=%s role=%s BU=%s designation=%s",
+            "JD draft saved: id=%s role=%s BU=%s designation=%s",
             jd_id, req.role, req.business_unit, req.designation,
         )
     except Exception as exc:
-        logger.error("Failed to persist JD to DB: %s", exc)
+        logger.error("Failed to persist JD draft to DB: %s", exc)
         raise HTTPException(status_code=500, detail=f"DB persist failed: {exc}") from exc
 
-    return jd_obj.model_dump()
+    return GeneratedJD(
+        jd_id=jd_id,
+        business_unit=req.business_unit,
+        role=req.role,
+        designation=req.designation,
+        years_of_experience=req.years_of_experience,
+        skills=req.skills,
+        content=content,
+        pdf_url=None,
+        created_at=now,
+    ).model_dump()
 
 
-@router.get("/api/jd/{jd_id}/download")
-def download_jd_pdf(jd_id: str):
-    """Stream the PDF for a generated JD as a file download."""
+class JDContentUpdateRequest(BaseModel):
+    content: JDContent
+
+
+@router.patch("/api/jd/{jd_id}")
+def update_jd_content(jd_id: str, req: JDContentUpdateRequest):
+    """Save human edits to a draft JD's content.  PDF is NOT regenerated here."""
     row = get_generated_jd(jd_id)
     if not row:
         raise HTTPException(status_code=404, detail="JD not found")
 
-    # Prefer the local file (faster); fall back to decoding the stored base64
+    updated = update_generated_jd(jd_id, {"content": req.content.model_dump()})
+    if not updated:
+        raise HTTPException(status_code=500, detail="Failed to update JD")
+
+    logger.info("JD content updated by reviewer: id=%s", jd_id)
+    return _jd_to_response(updated)
+
+
+@router.post("/api/jd/{jd_id}/generate-pdf")
+def generate_pdf_for_jd(jd_id: str):
+    """Render the current (possibly human-edited) content into a PDF.
+
+    Called after the TA reviewer approves/edits the draft. Generates the PDF,
+    stores it in Supabase as base64, and returns the download URL.
+    """
+    row = get_generated_jd(jd_id)
+    if not row:
+        raise HTTPException(status_code=404, detail="JD not found")
+
+    # Reconstruct content from the DB row (may include human edits)
+    raw_content = row.get("content") or {}
+    if isinstance(raw_content, str):
+        raw_content = json.loads(raw_content)
+
+    raw_skills = row.get("skills") or []
+    if isinstance(raw_skills, str):
+        raw_skills = json.loads(raw_skills)
+
+    try:
+        content = JDContent.model_validate(raw_content)
+    except Exception as exc:
+        raise HTTPException(status_code=422, detail=f"Stored content is malformed: {exc}") from exc
+
+    jd_obj = GeneratedJD(
+        jd_id=jd_id,
+        business_unit=str(row.get("business_unit", "")),
+        role=str(row.get("role", "")),
+        designation=str(row.get("designation", "")),
+        years_of_experience=int(row.get("years_of_experience", 0)),
+        skills=raw_skills,
+        content=content,
+        pdf_url=None,
+        created_at=str(row.get("created_at", "")),
+    )
+
+    uploads_dir = Path(__file__).resolve().parent.parent / "uploads" / "jds"
+    try:
+        from services.pdf_generator import generate_jd_pdf
+
+        pdf_path = generate_jd_pdf(jd_obj, uploads_dir)
+        pdf_url = f"/uploads/jds/{jd_id}.pdf"
+        pdf_base64 = base64.b64encode(pdf_path.read_bytes()).decode("utf-8")
+        logger.info("PDF finalised: %s (%d bytes)", pdf_path.name, pdf_path.stat().st_size)
+    except Exception as exc:
+        logger.error("PDF generation failed: %s", exc)
+        raise HTTPException(status_code=500, detail=f"PDF generation failed: {exc}") from exc
+
+    # Persist pdf_url + pdf_base64 back to the same DB row
+    update_generated_jd(jd_id, {"pdf_url": pdf_url, "pdf_base64": pdf_base64})
+
+    return {"jd_id": jd_id, "pdf_url": pdf_url}
+
+
+@router.get("/api/jd/{jd_id}/download")
+def download_jd_pdf(jd_id: str):
+    """Stream the finalised PDF for a JD as a file download."""
+    row = get_generated_jd(jd_id)
+    if not row:
+        raise HTTPException(status_code=404, detail="JD not found")
+
     pdf_path = Path(__file__).resolve().parent.parent / "uploads" / "jds" / f"{jd_id}.pdf"
 
     if not pdf_path.exists():
         b64 = row.get("pdf_base64")
         if not b64:
-            raise HTTPException(status_code=404, detail="PDF not available for this JD")
-        # Reconstruct the file from the stored base64
+            raise HTTPException(
+                status_code=404,
+                detail="PDF has not been generated yet. Call POST /api/jd/{id}/generate-pdf first.",
+            )
         pdf_path.parent.mkdir(parents=True, exist_ok=True)
         pdf_path.write_bytes(base64.b64decode(b64))
 
