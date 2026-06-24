@@ -10,6 +10,7 @@ vertical slice still runs end-to-end.
 from __future__ import annotations
 
 import logging
+from contextlib import contextmanager
 
 from services.config import settings
 
@@ -69,6 +70,26 @@ def get_pool():
     if not _available:
         raise RuntimeError("Postgres is not available.")
     return _pool
+
+
+@contextmanager
+def tenant_connection():
+    """Yield a pooled connection with `app.tenant_id` bound for RLS.
+
+    The GUC is set with `set_config(..., is_local => true)` so it is scoped to
+    the connection's current transaction and is automatically discarded when the
+    pool commits/rolls back and returns the connection — no leakage between
+    tenants sharing the pool. RLS policies read `current_setting('app.tenant_id')`,
+    so reads are tenant-filtered even when a query omits a WHERE clause, and the
+    column default fills tenant_id on inserts from the same GUC.
+    """
+    # Imported here to avoid a circular import at module load.
+    from services.tenant_context import get_tenant_id
+
+    tenant_id = get_tenant_id()
+    with get_pool().connection() as conn:
+        conn.execute("select set_config('app.tenant_id', %s, true)", (str(tenant_id),))
+        yield conn
 
 
 def close_pool() -> None:

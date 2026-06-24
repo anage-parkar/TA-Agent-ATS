@@ -9,9 +9,10 @@ import uuid
 from datetime import datetime, timezone
 from pathlib import Path
 
-from fastapi import APIRouter, HTTPException
+from fastapi import APIRouter, Depends, HTTPException
 from fastapi.responses import FileResponse
 
+from services.rbac import require_permission
 from agents.jd_generator import generate_jd
 from db.repository import create_generated_jd, get_generated_jd, list_generated_jds
 from models.jd_generation import GeneratedJD, JDContent, JDGenerationRequest
@@ -365,7 +366,7 @@ def get_jd(jd_id: str):
     return resp
 
 
-@router.post("/api/jd/generate")
+@router.post("/api/jd/generate", dependencies=[Depends(require_permission("job.create"))])
 def generate_jd_endpoint(req: JDGenerationRequest):
     """Generate a JD with AI, render a PDF, persist everything to Supabase, and return it."""
     bu_roles = BUSINESS_UNITS.get(req.business_unit)

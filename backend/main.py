@@ -11,29 +11,35 @@ from contextlib import asynccontextmanager
 
 from pathlib import Path
 
-from fastapi import FastAPI
+from fastapi import Depends, FastAPI
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.staticfiles import StaticFiles
 
 from db.supabase_client import close_pool, db_available
-from routers import applications, candidates, dashboard, emails, jobs, jd_generation, sourcing, website
-from services.llm_client import CLAUDE_BIN, cli_available
+from routers import admin, applications, candidates, dashboard, emails, jobs, jd_generation, sourcing, website
+from services.auth import bind_request_context
+from services.llm import get_gateway
 
 logging.basicConfig(level=logging.INFO, format="%(levelname)s %(name)s: %(message)s")
 logger = logging.getLogger("ta_agent")
 
 
 def _verify_llm() -> bool:
-    """Confirm the Claude Code CLI (Max-plan auth) is reachable."""
-    if cli_available():
-        logger.info("Claude Code CLI ready at %s", CLAUDE_BIN)
+    """Confirm the configured LLM gateway provider is ready."""
+    gateway = get_gateway()
+    if gateway.available():
+        logger.info("LLM gateway ready (provider=%s)", gateway.provider_name)
         return True
-    logger.warning(
-        "Claude Code CLI not available. Install it (`npm i -g "
-        "@anthropic-ai/claude-code`) and authenticate (`claude`), or set CLAUDE_BIN."
-    )
-
-    
+    if gateway.provider_name == "anthropic_api":
+        logger.warning(
+            "LLM gateway provider=api but ANTHROPIC_API_KEY is not set. Set it, "
+            "or use LLM_PROVIDER=cli for local development."
+        )
+    else:
+        logger.warning(
+            "LLM gateway provider=%s not ready (Claude Code CLI unavailable).",
+            gateway.provider_name,
+        )
     return False
 
 
@@ -47,7 +53,14 @@ async def lifespan(app: FastAPI):
     close_pool()
 
 
-app = FastAPI(title="TA Agent API", version="0.1.0", lifespan=lifespan)
+app = FastAPI(
+    title="TA Agent API",
+    version="0.1.0",
+    lifespan=lifespan,
+    # Bind tenant/user/role to the request context for every route, so the
+    # repository (in-memory filter + Postgres RLS) is always tenant-scoped.
+    dependencies=[Depends(bind_request_context)],
+)
 
 app.add_middleware(
     CORSMiddleware,
@@ -65,6 +78,7 @@ app.include_router(dashboard.router)
 app.include_router(website.router)
 app.include_router(emails.router)
 app.include_router(jd_generation.router)
+app.include_router(admin.router)
 
 # Serve uploaded files (resumes + generated JD PDFs).
 _uploads = Path(__file__).resolve().parent / "uploads"
@@ -75,9 +89,11 @@ app.mount("/uploads", StaticFiles(directory=str(_uploads)), name="uploads")
 
 @app.get("/health")
 def health():
+    gateway = get_gateway()
     return {
         "status": "ok",
-        "llm_cli": cli_available(),
+        "llm_provider": gateway.provider_name,
+        "llm_ready": gateway.available(),
         "database": db_available(),
     }
 

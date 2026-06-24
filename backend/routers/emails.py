@@ -12,8 +12,9 @@ from __future__ import annotations
 import logging
 from datetime import datetime, timezone
 
-from fastapi import APIRouter, Body, HTTPException
+from fastapi import APIRouter, Body, Depends, HTTPException
 
+from services.rbac import require_permission
 from agents.outreach import draft_decision_email, template_decision_email
 from agents.response_parser import classify_reply
 from db import repository
@@ -29,7 +30,7 @@ def _now():
     return datetime.now(timezone.utc).isoformat()
 
 
-@router.post("/applications/{application_id}/draft-email")
+@router.post("/applications/{application_id}/draft-email", dependencies=[Depends(require_permission("email.send"))])
 def draft_email(
     application_id: str,
     decision: str = Body(..., embed=True),
@@ -59,7 +60,7 @@ def draft_email(
     return {"decision": decision, "to": candidate.get("email"), **draft.model_dump()}
 
 
-@router.post("/applications/{application_id}/send-email")
+@router.post("/applications/{application_id}/send-email", dependencies=[Depends(require_permission("email.send"))])
 def send_email(
     application_id: str,
     decision: str = Body(...),
@@ -116,7 +117,7 @@ def send_email(
     }
 
 
-@router.post("/emails/poll-replies")
+@router.post("/emails/poll-replies", dependencies=[Depends(require_permission("email.send"))])
 def poll_replies():
     """Pull replies, classify intent, auto-advance interested ones to 'Replied'."""
     ok, reason = email_service.availability()

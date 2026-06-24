@@ -6,7 +6,9 @@ import json
 import logging
 from concurrent.futures import ThreadPoolExecutor
 
-from fastapi import APIRouter, HTTPException
+from fastapi import APIRouter, Depends, HTTPException
+
+from services.rbac import require_permission
 
 from agents import sourcing
 from agents.scoring import score_candidate
@@ -25,7 +27,7 @@ router = APIRouter(prefix="/api/candidates", tags=["candidates"])
 _job_to_parsed = parsed_from_record
 
 
-@router.post("/source")
+@router.post("/source", dependencies=[Depends(require_permission("candidate.source"))])
 def source_and_score(req: SourceRequest):
     """Source candidates for a job, score each via the ATS agent, persist apps."""
     job = repository.get_job(req.job_id)
@@ -57,9 +59,9 @@ def source_and_score(req: SourceRequest):
         for p in profiles
     ]
 
-    # Score concurrently — each call shells out to `claude -p` (~20s cold), and
-    # the calls are independent, so a small thread pool turns N sequential
-    # scorings into roughly one. Cap workers to stay friendly to the Max session.
+    # Score concurrently — each call goes through the LLM gateway (Anthropic
+    # API), and the calls are independent, so a small thread pool turns N
+    # sequential scorings into roughly one. Cap workers via llm_max_concurrency.
     def _score(pair):
         profile, candidate = pair
         try:
@@ -112,7 +114,7 @@ def list_candidates(job_id: str):
     return {"job_id": job_id, "candidates": apps}
 
 
-@router.post("/{candidate_id}/enrich")
+@router.post("/{candidate_id}/enrich", dependencies=[Depends(require_permission("candidate.source"))])
 def enrich_candidate(candidate_id: str):
     """Opt-in LinkedIn enrichment for one candidate (ToS/account-ban risk).
 
@@ -146,7 +148,7 @@ def enrich_candidate(candidate_id: str):
     return {"ok": True, "enrichment": merged}
 
 
-@router.post("/{application_id}/decision")
+@router.post("/{application_id}/decision", dependencies=[Depends(require_permission("application.decide"))])
 def recruiter_decision(application_id: str, decision: RecruiterDecision):
     """Human-in-the-loop gate: proceed or reject a candidate."""
     if decision.decision not in ("proceed", "reject"):

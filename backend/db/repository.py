@@ -1,8 +1,17 @@
-"""Data-access layer.
+"""Data-access layer (tenant-aware).
 
 Dispatches to Postgres when available, otherwise to an in-memory store so the
-app remains runnable before Docker/Postgres is set up. The public function
-signatures are identical in both modes and always return plain dicts.
+app remains runnable before Postgres is set up. Both paths are tenant-scoped:
+
+* Postgres — every call goes through `tenant_connection()`, which sets the
+  `app.tenant_id` GUC; RLS policies (migration 0006) filter reads and the
+  column default stamps tenant_id on inserts. App-layer filters are therefore
+  not the only line of defense.
+* In-memory — records are stamped with the current tenant on write and
+  filtered by it on read via the `_put` / `_get` / `_vals` helpers.
+
+The current tenant comes from the request-scoped context (services.tenant_context).
+Public signatures are identical in both modes and always return plain dicts.
 """
 
 from __future__ import annotations
@@ -11,7 +20,8 @@ import uuid
 from datetime import datetime, timezone
 from typing import Any, Optional
 
-from db.supabase_client import db_available, get_pool
+from db.supabase_client import db_available, tenant_connection
+from services.tenant_context import get_tenant_id, use_tenant
 
 # ── In-memory fallback store ──────────────────────────────────────────
 _jobs: dict[str, dict] = {}
@@ -19,6 +29,7 @@ _candidates: dict[str, dict] = {}
 _applications: dict[str, dict] = {}
 _emails: dict[str, dict] = {}
 _generated_jds: dict[str, dict] = {}
+_orgs: dict[str, dict] = {}   # control-plane (not tenant-filtered)
 
 
 def _now() -> str:
@@ -39,6 +50,26 @@ def _row(cur) -> Optional[dict]:
     return rows[0] if rows else None
 
 
+# ── In-memory tenant scoping helpers ──────────────────────────────────
+def _put(store: dict[str, dict], rec: dict) -> dict:
+    rec["tenant_id"] = get_tenant_id()
+    store[rec["id"]] = rec
+    return rec
+
+
+def _owned(rec: dict) -> bool:
+    return rec.get("tenant_id") == get_tenant_id()
+
+
+def _vals(store: dict[str, dict]) -> list[dict]:
+    return [r for r in store.values() if _owned(r)]
+
+
+def _get(store: dict[str, dict], _id: str) -> Optional[dict]:
+    rec = store.get(_id)
+    return rec if (rec is not None and _owned(rec)) else None
+
+
 # ── Jobs ──────────────────────────────────────────────────────────────
 _JOB_FIELDS = (
     "title", "source_url", "raw_html", "skills", "skills_nice_to_have",
@@ -51,16 +82,10 @@ def create_job(data: dict[str, Any]) -> dict:
     data = {k: data.get(k) for k in _JOB_FIELDS}
 
     if not db_available():
-        job = {
-            "id": _new_id(),
-            "created_at": _now(),
-            "parsed_at": _now(),
-            **data,
-        }
-        _jobs[job["id"]] = job
-        return job
+        job = {"id": _new_id(), "created_at": _now(), "parsed_at": _now(), **data}
+        return _put(_jobs, job)
 
-    with get_pool().connection() as conn:
+    with tenant_connection() as conn:
         cur = conn.execute(
             """
             insert into jobs
@@ -71,7 +96,7 @@ def create_job(data: dict[str, Any]) -> dict:
               (%(title)s, %(source_url)s, %(raw_html)s, %(skills)s,
                %(skills_nice_to_have)s, %(seniority)s, %(location)s,
                %(salary_range)s, %(responsibilities)s, %(tech_stack)s, now())
-            on conflict (source_url) do update set
+            on conflict (tenant_id, source_url) do update set
               title = excluded.title,
               skills = excluded.skills,
               parsed_at = now()
@@ -91,12 +116,12 @@ def find_or_create_job_by_title(title: str) -> dict:
         raise ValueError("Job title is required.")
 
     if not db_available():
-        for j in _jobs.values():
+        for j in _vals(_jobs):
             if (j.get("title") or "").strip().lower() == title.lower():
                 return j
         return create_job({"title": title, "source_url": None, "skills": []})
 
-    with get_pool().connection() as conn:
+    with tenant_connection() as conn:
         cur = conn.execute(
             "select * from jobs where lower(title) = lower(%s) order by created_at limit 1",
             (title,),
@@ -110,8 +135,8 @@ def find_or_create_job_by_title(title: str) -> dict:
 
 def get_job(job_id: str) -> Optional[dict]:
     if not db_available():
-        return _jobs.get(job_id)
-    with get_pool().connection() as conn:
+        return _get(_jobs, job_id)
+    with tenant_connection() as conn:
         cur = conn.execute("select * from jobs where id = %s", (job_id,))
         return _row(cur)
 
@@ -119,28 +144,29 @@ def get_job(job_id: str) -> Optional[dict]:
 def set_job_form_id(job_id: str, form_id: str) -> None:
     """Remember which Google/MS Form is linked to this job."""
     if not db_available():
-        if job_id in _jobs:
-            _jobs[job_id]["form_id"] = form_id
+        job = _get(_jobs, job_id)
+        if job:
+            job["form_id"] = form_id
         return
-    with get_pool().connection() as conn:
+    with tenant_connection() as conn:
         conn.execute("update jobs set form_id = %s where id = %s", (form_id, job_id))
 
 
 def get_job_by_source_url(source_url: str) -> Optional[dict]:
     if not db_available():
-        for j in _jobs.values():
+        for j in _vals(_jobs):
             if j.get("source_url") == source_url:
                 return j
         return None
-    with get_pool().connection() as conn:
+    with tenant_connection() as conn:
         cur = conn.execute("select * from jobs where source_url = %s", (source_url,))
         return _row(cur)
 
 
 def list_jobs() -> list[dict]:
     if not db_available():
-        return sorted(_jobs.values(), key=lambda j: j["created_at"], reverse=True)
-    with get_pool().connection() as conn:
+        return sorted(_vals(_jobs), key=lambda j: j["created_at"], reverse=True)
+    with tenant_connection() as conn:
         cur = conn.execute("select * from jobs order by created_at desc")
         return _rows(cur)
 
@@ -165,16 +191,15 @@ def upsert_candidate(data: dict[str, Any]) -> dict:
     row = {k: data.get(k) for k in _CANDIDATE_FIELDS}
 
     if not db_available():
-        # de-dupe on linkedin_url (when present), else on email
+        # de-dupe on linkedin_url (when present), else on email — within tenant.
         key = row.get("linkedin_url") or row.get("email")
         if key:
-            for c in _candidates.values():
+            for c in _vals(_candidates):
                 if (c.get("linkedin_url") or c.get("email")) == key:
                     c.update({k: v for k, v in row.items() if v is not None})
                     return c
         cand = {"id": _new_id(), "created_at": _now(), **row}
-        _candidates[cand["id"]] = cand
-        return cand
+        return _put(_candidates, cand)
 
     insert_sql = """
         insert into candidates
@@ -185,12 +210,12 @@ def upsert_candidate(data: dict[str, Any]) -> dict:
            %(headline)s, %(skills)s, %(experience_years)s, %(location)s,
            %(resume_url)s, %(raw_profile)s)
     """
-    with get_pool().connection() as conn:
+    with tenant_connection() as conn:
         if row.get("linkedin_url"):
             cur = conn.execute(
                 insert_sql
                 + """
-                on conflict (linkedin_url) do update set
+                on conflict (tenant_id, linkedin_url) do update set
                   headline = excluded.headline,
                   skills = excluded.skills,
                   email = coalesce(excluded.email, candidates.email),
@@ -202,9 +227,8 @@ def upsert_candidate(data: dict[str, Any]) -> dict:
             )
             return _row(cur)
 
-        # No linkedin_url (e.g. form applicants) — there's no unique index to
-        # conflict on (NULLs are distinct), so dedupe on email manually to avoid
-        # creating a new row every re-sync.
+        # No linkedin_url (e.g. form applicants) — NULLs are distinct in the
+        # unique index, so dedupe on email manually (RLS already scopes to tenant).
         if row.get("email"):
             existing = _row(
                 conn.execute(
@@ -236,8 +260,8 @@ def upsert_candidate(data: dict[str, Any]) -> dict:
 
 def get_candidate(candidate_id: str) -> Optional[dict]:
     if not db_available():
-        return _candidates.get(candidate_id)
-    with get_pool().connection() as conn:
+        return _get(_candidates, candidate_id)
+    with tenant_connection() as conn:
         cur = conn.execute("select * from candidates where id = %s", (candidate_id,))
         return _row(cur)
 
@@ -245,12 +269,12 @@ def get_candidate(candidate_id: str) -> Optional[dict]:
 def update_candidate_enrichment(candidate_id: str, enrichment: str) -> Optional[dict]:
     """Store scraped enrichment JSON on the candidate."""
     if not db_available():
-        cand = _candidates.get(candidate_id)
+        cand = _get(_candidates, candidate_id)
         if cand:
             cand["enrichment"] = enrichment
             cand["enriched_at"] = _now()
         return cand
-    with get_pool().connection() as conn:
+    with tenant_connection() as conn:
         cur = conn.execute(
             "update candidates set enrichment = %s, enriched_at = now() where id = %s returning *",
             (enrichment, candidate_id),
@@ -263,7 +287,7 @@ def create_application(data: dict[str, Any]) -> dict:
     if not db_available():
         # de-dupe on (job_id, candidate_id). Preserve a recruiter decision —
         # a re-sync must never resurrect a rejected/approved application.
-        for a in _applications.values():
+        for a in _vals(_applications):
             if a["job_id"] == data["job_id"] and a["candidate_id"] == data["candidate_id"]:
                 for k, v in data.items():
                     if k in ("status", "source", "recruiter_decision"):
@@ -283,10 +307,9 @@ def create_application(data: dict[str, Any]) -> dict:
             "updated_at": _now(),
             **data,
         }
-        _applications[app["id"]] = app
-        return app
+        return _put(_applications, app)
 
-    with get_pool().connection() as conn:
+    with tenant_connection() as conn:
         cur = conn.execute(
             """
             insert into applications
@@ -315,14 +338,14 @@ def list_applications_for_job(job_id: str) -> list[dict]:
     """Return applications joined with candidate info, ranked by ATS score."""
     if not db_available():
         out = []
-        for app in _applications.values():
+        for app in _vals(_applications):
             if app["job_id"] != job_id:
                 continue
-            cand = _candidates.get(app["candidate_id"], {})
+            cand = _get(_candidates, app["candidate_id"]) or {}
             out.append({**app, "candidate": cand})
         return sorted(out, key=lambda a: a.get("ats_score") or 0, reverse=True)
 
-    with get_pool().connection() as conn:
+    with tenant_connection() as conn:
         cur = conn.execute(
             """
             select a.*, row_to_json(c.*) as candidate
@@ -341,17 +364,17 @@ def list_applications_by_sources(sources: list[str]) -> list[dict]:
     joined with candidate + job title. Ranked by score."""
     if not db_available():
         out = []
-        for app in _applications.values():
+        for app in _vals(_applications):
             if app.get("source") not in sources:
                 continue
-            cand = _candidates.get(app["candidate_id"], {})
-            job = _jobs.get(app["job_id"], {})
+            cand = _get(_candidates, app["candidate_id"]) or {}
+            job = _get(_jobs, app["job_id"]) or {}
             out.append(
                 {**app, "candidate": cand, "job_title": job.get("title"), "job_id": app["job_id"]}
             )
         return sorted(out, key=lambda a: a.get("ats_score") or -1, reverse=True)
 
-    with get_pool().connection() as conn:
+    with tenant_connection() as conn:
         cur = conn.execute(
             """
             select a.*, row_to_json(c.*) as candidate, j.title as job_title
@@ -370,7 +393,7 @@ def list_jobs_with_channel_counts(sources: list[str]) -> list[dict]:
     """Jobs that have applications in the given channel, with counts."""
     if not db_available():
         agg: dict[str, dict] = {}
-        for app in _applications.values():
+        for app in _vals(_applications):
             if app.get("source") not in sources:
                 continue
             jid = app["job_id"]
@@ -382,11 +405,11 @@ def list_jobs_with_channel_counts(sources: list[str]) -> list[dict]:
                 d["reviewed"] += 1
         out = []
         for jid, d in agg.items():
-            job = _jobs.get(jid, {})
+            job = _get(_jobs, jid) or {}
             out.append({"job_id": jid, "title": job.get("title"), "location": job.get("location"), **d})
         return sorted(out, key=lambda x: x["count"], reverse=True)
 
-    with get_pool().connection() as conn:
+    with tenant_connection() as conn:
         cur = conn.execute(
             """
             select j.id as job_id, j.title, j.location,
@@ -409,10 +432,13 @@ def list_website_jobs() -> list[dict]:
     including those with zero applicants yet, with website_portal counts."""
     if not db_available():
         out = []
-        for j in _jobs.values():
+        for j in _vals(_jobs):
             if not str(j.get("source_url") or "").startswith("website:"):
                 continue
-            apps = [a for a in _applications.values() if a["job_id"] == j["id"] and a.get("source") == "website_portal"]
+            apps = [
+                a for a in _vals(_applications)
+                if a["job_id"] == j["id"] and a.get("source") == "website_portal"
+            ]
             out.append({
                 "job_id": j["id"], "title": j.get("title"), "location": j.get("location"),
                 "count": len(apps),
@@ -421,7 +447,7 @@ def list_website_jobs() -> list[dict]:
             })
         return sorted(out, key=lambda x: x["title"] or "")
 
-    with get_pool().connection() as conn:
+    with tenant_connection() as conn:
         cur = conn.execute(
             """
             select j.id as job_id, j.title, j.location,
@@ -442,10 +468,10 @@ def count_applications_by_source() -> dict[str, int]:
     """Map of source -> application count (across all jobs)."""
     if not db_available():
         counts: dict[str, int] = {}
-        for app in _applications.values():
+        for app in _vals(_applications):
             counts[app.get("source", "manual")] = counts.get(app.get("source", "manual"), 0) + 1
         return counts
-    with get_pool().connection() as conn:
+    with tenant_connection() as conn:
         cur = conn.execute("select source, count(*) from applications group by source")
         return {row[0]: row[1] for row in cur.fetchall()}
 
@@ -453,13 +479,13 @@ def count_applications_by_source() -> dict[str, int]:
 def get_application_detail(application_id: str) -> Optional[dict]:
     """Full application + candidate + job for the detail view."""
     if not db_available():
-        app = _applications.get(application_id)
+        app = _get(_applications, application_id)
         if not app:
             return None
-        cand = _candidates.get(app["candidate_id"], {})
-        job = _jobs.get(app["job_id"], {})
+        cand = _get(_candidates, app["candidate_id"]) or {}
+        job = _get(_jobs, app["job_id"]) or {}
         return {**app, "candidate": cand, "job_title": job.get("title")}
-    with get_pool().connection() as conn:
+    with tenant_connection() as conn:
         cur = conn.execute(
             """
             select a.*, row_to_json(c.*) as candidate, j.title as job_title
@@ -477,9 +503,8 @@ def get_application_detail(application_id: str) -> Optional[dict]:
 def create_email(data: dict[str, Any]) -> dict:
     if not db_available():
         em = {"id": _new_id(), "created_at": _now(), **data}
-        _emails[em["id"]] = em
-        return em
-    with get_pool().connection() as conn:
+        return _put(_emails, em)
+    with tenant_connection() as conn:
         cur = conn.execute(
             """
             insert into emails
@@ -510,10 +535,10 @@ def list_outbound_threads() -> list[dict]:
     if not db_available():
         return [
             {"thread_id": e["thread_id"], "application_id": e["application_id"]}
-            for e in _emails.values()
+            for e in _vals(_emails)
             if e.get("direction") == "outbound" and e.get("thread_id")
         ]
-    with get_pool().connection() as conn:
+    with tenant_connection() as conn:
         cur = conn.execute(
             "select distinct thread_id, application_id from emails "
             "where direction = 'outbound' and thread_id is not null"
@@ -524,10 +549,10 @@ def list_outbound_threads() -> list[dict]:
 def list_emails_for_application(app_id: str) -> list[dict]:
     if not db_available():
         return sorted(
-            [e for e in _emails.values() if e.get("application_id") == app_id],
+            [e for e in _vals(_emails) if e.get("application_id") == app_id],
             key=lambda e: e.get("created_at") or "",
         )
-    with get_pool().connection() as conn:
+    with tenant_connection() as conn:
         cur = conn.execute(
             "select * from emails where application_id = %s order by created_at", (app_id,)
         )
@@ -538,9 +563,9 @@ def reply_already_recorded(thread_id: str) -> bool:
     if not db_available():
         return any(
             e.get("thread_id") == thread_id and e.get("direction") == "inbound"
-            for e in _emails.values()
+            for e in _vals(_emails)
         )
-    with get_pool().connection() as conn:
+    with tenant_connection() as conn:
         cur = conn.execute(
             "select 1 from emails where thread_id = %s and direction = 'inbound' limit 1",
             (thread_id,),
@@ -564,12 +589,11 @@ def create_generated_jd(data: dict[str, Any]) -> dict:
             "pdf_url": data.get("pdf_url"),
             "created_at": data.get("created_at", _now()),
         }
-        _generated_jds[jd["id"]] = jd
-        return jd
+        return _put(_generated_jds, jd)
 
     import json as _json
 
-    with get_pool().connection() as conn:
+    with tenant_connection() as conn:
         cur = conn.execute(
             """
             insert into generated_jds
@@ -600,29 +624,23 @@ def create_generated_jd(data: dict[str, Any]) -> dict:
 def list_generated_jds() -> list[dict]:
     """Return all generated JDs newest-first."""
     if not db_available():
-        return sorted(_generated_jds.values(), key=lambda j: j["created_at"], reverse=True)
-
-    with get_pool().connection() as conn:
-        cur = conn.execute(
-            "select * from generated_jds order by created_at desc"
-        )
+        return sorted(_vals(_generated_jds), key=lambda j: j["created_at"], reverse=True)
+    with tenant_connection() as conn:
+        cur = conn.execute("select * from generated_jds order by created_at desc")
         return _rows(cur)
 
 
 def get_generated_jd(jd_id: str) -> Optional[dict]:
     if not db_available():
-        return _generated_jds.get(jd_id)
-
-    with get_pool().connection() as conn:
-        cur = conn.execute(
-            "select * from generated_jds where id = %s", (jd_id,)
-        )
+        return _get(_generated_jds, jd_id)
+    with tenant_connection() as conn:
+        cur = conn.execute("select * from generated_jds where id = %s", (jd_id,))
         return _row(cur)
 
 
 def update_application(app_id: str, fields: dict[str, Any]) -> Optional[dict]:
     if not db_available():
-        app = _applications.get(app_id)
+        app = _get(_applications, app_id)
         if not app:
             return None
         app.update(fields)
@@ -630,9 +648,83 @@ def update_application(app_id: str, fields: dict[str, Any]) -> Optional[dict]:
         return app
 
     sets = ", ".join(f"{k} = %({k})s" for k in fields)
-    with get_pool().connection() as conn:
+    with tenant_connection() as conn:
         cur = conn.execute(
             f"update applications set {sets} where id = %(id)s returning *",
             {**fields, "id": app_id},
+        )
+        return _row(cur)
+
+
+# ── Tenant data lifecycle (export / delete) ───────────────────────────
+# Independent per-tenant export and purge (Workstream A acceptance + supports
+# Workstream F right-to-erasure / portability). Both bind the target tenant so
+# RLS (DB) / the in-memory filter scope every row to that tenant only.
+
+_DOMAIN_STORES = {
+    "jobs": _jobs,
+    "candidates": _candidates,
+    "applications": _applications,
+    "emails": _emails,
+    "generated_jds": _generated_jds,
+}
+# DB delete order respects FK dependencies (children first).
+_DELETE_ORDER = (
+    "applications", "emails", "interviews", "job_members",
+    "generated_jds", "candidates", "jobs",
+)
+_EXPORT_TABLES = (
+    "jobs", "candidates", "applications", "emails", "interviews",
+    "generated_jds", "job_members", "memberships",
+)
+
+
+def export_tenant(tenant_id: str) -> dict[str, list[dict]]:
+    """Return every row owned by `tenant_id`, grouped by table."""
+    if not db_available():
+        with use_tenant(tenant_id):
+            return {name: list(_vals(store)) for name, store in _DOMAIN_STORES.items()}
+
+    out: dict[str, list[dict]] = {}
+    with use_tenant(tenant_id), tenant_connection() as conn:
+        for table in _EXPORT_TABLES:
+            cur = conn.execute(f"select * from {table}")  # RLS-scoped to tenant
+            out[table] = _rows(cur)
+    return out
+
+
+def delete_tenant(tenant_id: str) -> dict[str, int]:
+    """Purge all domain data for `tenant_id`. Returns rows deleted per table.
+
+    Keeps the organization/users rows; this is a data purge, not org deletion.
+    """
+    if not db_available():
+        deleted: dict[str, int] = {}
+        for name, store in _DOMAIN_STORES.items():
+            ids = [k for k, v in store.items() if v.get("tenant_id") == tenant_id]
+            for k in ids:
+                del store[k]
+            deleted[name] = len(ids)
+        return deleted
+
+    deleted = {}
+    with use_tenant(tenant_id), tenant_connection() as conn:
+        for table in _DELETE_ORDER:
+            cur = conn.execute(f"delete from {table}")  # RLS-scoped to tenant
+            deleted[table] = cur.rowcount
+    return deleted
+
+
+# ── Organizations / memberships (control plane) ───────────────────────
+def create_organization(name: str, slug: str | None = None, region: str = "global") -> dict:
+    """Create a tenant. Control-plane table (no RLS); admin-gated at the router."""
+    if not db_available():
+        org = {"id": _new_id(), "name": name, "slug": slug, "region": region, "created_at": _now()}
+        _orgs[org["id"]] = org
+        return org
+    with tenant_connection() as conn:
+        cur = conn.execute(
+            "insert into organizations (name, slug, region) values (%s, %s, %s) returning *",
+            (name, slug, region),
         )
         return _row(cur)

@@ -8,9 +8,10 @@ from __future__ import annotations
 
 import json
 
-from fastapi import APIRouter, Body, HTTPException
+from fastapi import APIRouter, Body, Depends, HTTPException
 
 from db import repository
+from services.rbac import require_permission
 
 router = APIRouter(prefix="/api", tags=["dashboard"])
 
@@ -89,7 +90,7 @@ def channel_candidates(channel: str):
 _PIPELINE_STAGES = {"Sourced", "Reviewed", "Outreach", "Replied", "Interview", "Offer"}
 
 
-@router.post("/applications/{application_id}/stage")
+@router.post("/applications/{application_id}/stage", dependencies=[Depends(require_permission("application.stage"))])
 def set_application_stage(application_id: str, stage: str = Body(..., embed=True)):
     """Move an application to a pipeline stage (Kanban drag-drop)."""
     if stage not in _PIPELINE_STAGES:

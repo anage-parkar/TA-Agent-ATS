@@ -6,8 +6,9 @@ import json
 import logging
 from concurrent.futures import ThreadPoolExecutor
 
-from fastapi import APIRouter, HTTPException
+from fastapi import APIRouter, Depends, HTTPException
 
+from services.rbac import require_permission
 from agents.jd_parser import parse_job
 from agents.scoring import score_candidate
 from db import repository
@@ -23,7 +24,7 @@ logger = logging.getLogger("ta_agent.routers.jobs")
 router = APIRouter(prefix="/api/jobs", tags=["jobs"])
 
 
-@router.post("/sync")
+@router.post("/sync", dependencies=[Depends(require_permission("job.sync"))])
 def sync_job(req: JobSyncRequest):
     """Fetch a LinkedIn job post, parse it, and store the structured result."""
     try:
@@ -64,7 +65,7 @@ def sync_job(req: JobSyncRequest):
     return {"job_id": job["id"], "parsed_fields": parsed.model_dump()}
 
 
-@router.post("/ensure")
+@router.post("/ensure", dependencies=[Depends(require_permission("job.create"))])
 def ensure_job(payload: dict):
     """Find-or-create a job by typed title; returns its id.
 
@@ -91,7 +92,7 @@ def get_job(job_id: str):
     return job
 
 
-@router.post("/{job_id}/score-applicants")
+@router.post("/{job_id}/score-applicants", dependencies=[Depends(require_permission("application.score"))])
 def score_applicants(job_id: str):
     """Score every not-yet-scored inbound applicant for this job.
 
