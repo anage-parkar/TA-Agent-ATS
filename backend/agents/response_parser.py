@@ -10,6 +10,7 @@ import logging
 
 from pydantic import BaseModel, Field
 
+from services import sanitize
 from services.llm import LLMError, get_gateway
 
 logger = logging.getLogger("ta_agent.agents.response_parser")
@@ -24,8 +25,11 @@ class ReplyIntent(BaseModel):
 
 def classify_reply(reply_text: str) -> ReplyIntent:
     """Classify a reply. Raises LLMError on failure/invalid output."""
+    # Sanitize the untrusted reply and wrap it in data-only delimiters.
+    cleaned = sanitize.sanitize_text(reply_text[:4000]) or ""
+    user = sanitize.wrap_untrusted("reply", cleaned)
     try:
-        data = get_gateway().complete_json(prompt="response_parser", user=reply_text[:4000])
+        data = get_gateway().complete_json(prompt="response_parser", user=user)
     except LLMError:
         logger.exception("Reply classification failed")
         raise

@@ -16,6 +16,8 @@ from __future__ import annotations
 
 import re
 
+from services import sanitize
+
 # Gendered / affinity pronouns → neutral.
 _PRONOUNS = {
     "he": "they", "she": "they", "him": "them", "her": "them", "his": "their",
@@ -38,7 +40,9 @@ _AFFINITY_RE = re.compile("|".join(_AFFINITY_PATTERNS), re.IGNORECASE)
 def _scrub_text(text: str | None, *, name: str | None = None) -> str | None:
     if not text:
         return text
-    out = text
+    # First sanitize untrusted input (strip hidden/zero-width/bidi chars, collapse
+    # keyword stuffing, neutralize injection directives), then remove PII proxies.
+    out = sanitize.sanitize_text(text) or ""
     # Remove the person's own name tokens.
     for tok in re.split(r"\s+", (name or "").strip()):
         if len(tok) >= 2:
@@ -79,7 +83,7 @@ def redact_profile(candidate: dict, enrichment: dict | None = None) -> dict:
     name = candidate.get("full_name")
     redacted: dict = {
         "headline": _scrub_text(candidate.get("headline"), name=name),
-        "skills": list(candidate.get("skills") or []),
+        "skills": sanitize.sanitize_skills(candidate.get("skills")),
         "experience_years": candidate.get("experience_years"),
         # NOTE: name/email/phone/linkedin_url/location intentionally omitted.
         # location is assessed deterministically (knockouts), not by the LLM.
@@ -90,6 +94,5 @@ def redact_profile(candidate: dict, enrichment: dict | None = None) -> dict:
         redacted["education"] = _redact_education(enrichment)
         redacted["certifications"] = enrichment.get("certifications")
         extra = enrichment.get("skills") or []
-        merged = list(dict.fromkeys([*redacted["skills"], *extra]))  # de-dup, keep order
-        redacted["skills"] = merged
+        redacted["skills"] = sanitize.sanitize_skills([*redacted["skills"], *extra])
     return redacted

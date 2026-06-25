@@ -190,6 +190,15 @@ def score_applicants(job_id: str):
                 metadata={"overall_score": breakdown.overall_score,
                           "below_threshold": res.below_threshold},
             )
+            if res.quarantined:
+                # Anomalous model output — flag for human review, don't trust it.
+                repository.update_application(app["id"], {"human_review_requested": True})
+                events.emit_event(
+                    "candidate.scoring_quarantined",
+                    entity_type="application", entity_id=app["id"],
+                    actor_type="system", actor_id="output_guard",
+                    metadata={"anomalies": res.anomalies},
+                )
 
         results.append(
             {

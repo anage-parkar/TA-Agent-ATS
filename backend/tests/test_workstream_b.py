@@ -105,7 +105,7 @@ def test_ai_decision_recorded_with_versions_and_evidence(make_gateway):
     d = decisions[0]
     assert d["kind"] == "ats_score"
     assert d["model_version"] == "claude-sonnet-4-6"
-    assert d["prompt_version"] == 1
+    assert d["prompt_version"] == 2   # scoring.rubric bumped to v2 in Workstream E
     assert d["input_hash"]  # non-empty
     assert d["scores"]["overall_score"] == 69.5   # computed from default weights
     assert d["evidence"]["skill_match"] == "Python"

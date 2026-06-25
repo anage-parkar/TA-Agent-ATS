@@ -19,7 +19,7 @@ from fastapi import APIRouter, File, Form, HTTPException, Request, UploadFile
 
 from db import repository
 from models.candidate import ApplicantSubmission
-from services import events
+from services import attachments, events
 from services.applicants import ingest_applicant
 from services.config import settings
 
@@ -75,13 +75,13 @@ async def apply(
 
     resume_url = None
     if resume and resume.filename:
-        ext = Path(resume.filename).suffix.lower()
-        if ext not in _ALLOWED_RESUME_EXT:
-            raise HTTPException(status_code=400, detail=f"Unsupported resume type: {ext}")
-        fname = f"{uuid.uuid4().hex}{ext}"
         content = await resume.read()
-        if len(content) > 10 * 1024 * 1024:
-            raise HTTPException(status_code=400, detail="Resume exceeds 10 MB")
+        try:
+            # Validate type/size/magic-bytes + scan seam before it touches disk.
+            ext = attachments.validate_upload(resume.filename, content, resume.content_type)
+        except attachments.AttachmentRejected as exc:
+            raise HTTPException(status_code=400, detail=str(exc)) from exc
+        fname = f"{uuid.uuid4().hex}{ext}"   # never trust the client filename
         (UPLOAD_DIR / fname).write_bytes(content)
         resume_url = f"/uploads/resumes/{fname}"
 

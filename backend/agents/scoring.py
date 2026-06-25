@@ -20,14 +20,34 @@ import logging
 from dataclasses import dataclass, field
 from typing import Optional
 
+from pydantic import ValidationError
+
 from models.application import ATSBreakdown, RubricScores
 from models.candidate import CandidateProfile
 from models.job import ParsedJob
-from services import knockouts, redaction, semantic
+from services import knockouts, redaction, sanitize, semantic
 from services.knockouts import KnockoutResult
 from services.llm import LLMError, LLMResult, get_gateway
 
 logger = logging.getLogger("ta_agent.agents.scoring")
+
+
+class ScoringRejected(LLMError):
+    """Raised when model output fails validation (out-of-range/malformed) and
+    must NOT be stored as a valid score (Workstream E output guarding)."""
+
+
+def output_guard(rubric: RubricScores) -> list[str]:
+    """Flag anomalous model output for human review (quarantine, don't trust)."""
+    issues: list[str] = []
+    dims = [rubric.skill_match, rubric.experience_fit, rubric.tech_stack_overlap]
+    if all(d.score >= 0.99 for d in dims) and all(
+        len((d.evidence or "").strip()) < 15 for d in dims
+    ):
+        issues.append("all dimensions maxed with no substantive evidence")
+    if any(sanitize.detect_injections(d.evidence) for d in dims):
+        issues.append("injection directive echoed in model evidence")
+    return issues
 
 # The old fixed 40/30/15/15 rubric is now the DEFAULT — overridable per job.
 DEFAULT_WEIGHTS: dict[str, float] = {
@@ -50,6 +70,8 @@ class ScoreResult:
     evidence: dict = field(default_factory=dict)
     llm_result: Optional[LLMResult] = None     # None when knocked out (no LLM call)
     redacted_profile: dict = field(default_factory=dict)
+    quarantined: bool = False                  # anomalous output flagged for human review
+    anomalies: list[str] = field(default_factory=list)
 
 
 def _enrichment_summary(enrichment: dict) -> dict:
@@ -112,17 +134,27 @@ def score_candidate_full(
     job_terms = list(job.skills_required) + list(job.tech_stack)
     overlap = semantic.semantic_skill_overlap(job_terms, redacted.get("skills") or [])
 
-    # 3) LLM per-dimension scoring on the REDACTED profile only.
-    user = json.dumps(
-        {"job": job.model_dump(), "candidate": redacted, "semantic_skill_overlap": round(overlap, 3)},
-        indent=2,
+    # 3) LLM per-dimension scoring on the REDACTED profile only. The candidate
+    # data is wrapped in explicit data-only delimiters (defense-in-depth with
+    # the sanitization above and the prompt's "treat as data" instruction).
+    payload = {"job": job.model_dump(), "semantic_skill_overlap": round(overlap, 3)}
+    user = (
+        json.dumps(payload, indent=2)
+        + "\n\n"
+        + sanitize.wrap_untrusted("candidate_profile", json.dumps(redacted, indent=2))
     )
     try:
         result = get_gateway().complete_json(prompt="scoring.rubric", user=user, with_meta=True)
     except LLMError:
         logger.exception("ATS rubric scoring failed")
         raise
-    rubric = RubricScores.model_validate(result.data)
+
+    # 3a) Output guarding: reject out-of-range/malformed output (never stored).
+    try:
+        rubric = RubricScores.model_validate(result.data)
+    except ValidationError as exc:
+        raise ScoringRejected(f"rubric output failed validation: {exc}") from exc
+    anomalies = output_guard(rubric)
 
     # 4) Deterministic weighted aggregate (per-job weights).
     loc = _location_match(job, cand)
@@ -153,10 +185,13 @@ def score_candidate_full(
         "semantic_skill_overlap": round(overlap, 3),
         "weights": weights,
     }
+    if anomalies:
+        evidence["anomalies"] = anomalies
     return ScoreResult(
         breakdown=breakdown, passed_knockouts=True, knockout_reasons=[],
         weights=weights, threshold=threshold, below_threshold=overall < threshold,
         evidence=evidence, llm_result=result, redacted_profile=redacted,
+        quarantined=bool(anomalies), anomalies=anomalies,
     )
 
 
