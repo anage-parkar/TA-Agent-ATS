@@ -6,7 +6,7 @@ import json
 import logging
 from concurrent.futures import ThreadPoolExecutor
 
-from fastapi import APIRouter, Depends, HTTPException
+from fastapi import APIRouter, Body, Depends, HTTPException
 
 from services.rbac import require_permission
 from agents.jd_parser import parse_job
@@ -185,3 +185,76 @@ def score_applicants(job_id: str):
 
     results.sort(key=lambda r: r["ats_score"], reverse=True)
     return {"job_id": job_id, "scored": len(results), "candidates": results}
+
+
+@router.get("/{job_id}/review-queue")
+def review_queue(job_id: str, threshold: float = 60.0):
+    """Human review queue: scored applicants awaiting a human decision.
+
+    AI scoring ranks and surfaces — it never rejects. Sub-threshold candidates
+    land here (flagged) for a recruiter to review and act on, instead of being
+    auto-rejected. Candidates who asked for human review are flagged too.
+    """
+    apps = repository.list_applications_for_job(job_id)
+    queue = []
+    for a in apps:
+        if a.get("recruiter_decision"):
+            continue  # already decided by a human
+        if a.get("ats_score") is None:
+            continue  # not scored yet
+        score = a.get("ats_score") or 0
+        queue.append(
+            {
+                "application_id": a["id"],
+                "candidate": a.get("candidate"),
+                "ats_score": score,
+                "below_threshold": score < threshold,
+                "human_review_requested": bool(a.get("human_review_requested")),
+            }
+        )
+    queue.sort(key=lambda r: r["ats_score"])
+    return {
+        "job_id": job_id,
+        "threshold": threshold,
+        "count": len(queue),
+        "below_threshold": sum(1 for r in queue if r["below_threshold"]),
+        "queue": queue,
+    }
+
+
+@router.post("/{job_id}/bulk-reject", dependencies=[Depends(require_permission("application.decide"))])
+def bulk_reject(
+    job_id: str,
+    application_ids: list[str] | None = Body(default=None, embed=True),
+    below_threshold: float | None = Body(default=None, embed=True),
+):
+    """Reject many applicants in one human click — still a recorded human decision.
+
+    Supply explicit `application_ids`, or `below_threshold` to reject all
+    not-yet-decided, scored applicants under that score. Each rejection is
+    audited with the acting human (the rejected transition is enforced
+    human-only at the repository layer).
+    """
+    if not application_ids and below_threshold is None:
+        raise HTTPException(
+            status_code=400, detail="Provide application_ids or below_threshold."
+        )
+
+    targets = set(application_ids or [])
+    if below_threshold is not None:
+        for a in repository.list_applications_for_job(job_id):
+            if (
+                a.get("recruiter_decision") is None
+                and a.get("ats_score") is not None
+                and (a.get("ats_score") or 0) < below_threshold
+            ):
+                targets.add(a["id"])
+
+    rejected = []
+    for app_id in targets:
+        updated = repository.update_application(
+            app_id, {"status": "rejected", "recruiter_decision": "reject"}
+        )
+        if updated:
+            rejected.append(app_id)
+    return {"job_id": job_id, "rejected": len(rejected), "application_ids": rejected}

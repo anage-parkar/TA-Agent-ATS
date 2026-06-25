@@ -52,6 +52,18 @@ def get_principal() -> Principal:
     return _principal.get() or _default_principal()
 
 
+def is_human_principal() -> bool:
+    """True when a principal is explicitly bound to this context.
+
+    A principal is bound by the request dependency (an authenticated human is
+    driving the call) or by use_principal/use_tenant (an operator/test). It is
+    NOT bound in unattended contexts — agent runs, cron jobs, pollers — which
+    fall back to the default. The rejection guard uses this so a solely
+    automated context can never reject a candidate.
+    """
+    return _principal.get() is not None
+
+
 def get_tenant_id() -> str:
     return get_principal().tenant_id
 

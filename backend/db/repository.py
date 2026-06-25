@@ -24,7 +24,21 @@ from datetime import datetime, timezone
 from typing import Any, Optional
 
 from db.supabase_client import db_available, tenant_connection
-from services.tenant_context import current_role, current_user_id, get_tenant_id, use_tenant
+from services.tenant_context import (
+    current_user_id,
+    get_tenant_id,
+    is_human_principal,
+    use_tenant,
+)
+
+
+class HumanActorRequired(RuntimeError):
+    """Raised when a rejection is attempted without a bound human actor.
+
+    Engineering Rule 4 / Workstream C: a solely-automated adverse decision is
+    forbidden. The rejected transition is only allowed from a context where a
+    human principal is bound (an authenticated request or an operator action).
+    """
 
 # ── In-memory fallback store ──────────────────────────────────────────
 _jobs: dict[str, dict] = {}
@@ -741,6 +755,15 @@ def get_generated_jd(jd_id: str) -> Optional[dict]:
 
 
 def update_application(app_id: str, fields: dict[str, Any]) -> Optional[dict]:
+    # Human-in-the-loop gate: a transition to 'rejected' is a solely-automated
+    # adverse decision unless a human principal is bound. Block it otherwise —
+    # this is the single mutation point, so no code path can bypass it.
+    if fields.get("status") == "rejected" and not is_human_principal():
+        raise HumanActorRequired(
+            "rejecting an application requires a recorded human actor"
+        )
+    actor_type = "human" if is_human_principal() else "system"
+
     # Capture the prior values of the fields being changed, for the audit trail.
     _audit_keys = [k for k in fields if k in ("status", "stage", "recruiter_decision")]
 
@@ -755,6 +778,7 @@ def update_application(app_id: str, fields: dict[str, Any]) -> Optional[dict]:
             _emit_audit(
                 "application.updated", "application", app_id,
                 before=before, after={k: app.get(k) for k in _audit_keys},
+                actor_type=actor_type,
             )
         return app
 
@@ -773,6 +797,7 @@ def update_application(app_id: str, fields: dict[str, Any]) -> Optional[dict]:
             _emit_audit(
                 "application.updated", "application", app_id,
                 before=before, after={k: updated.get(k) for k in _audit_keys},
+                actor_type=actor_type,
             )
         return updated
 

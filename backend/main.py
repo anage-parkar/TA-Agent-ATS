@@ -11,10 +11,12 @@ from contextlib import asynccontextmanager
 
 from pathlib import Path
 
-from fastapi import Depends, FastAPI
+from fastapi import Depends, FastAPI, Request
 from fastapi.middleware.cors import CORSMiddleware
+from fastapi.responses import JSONResponse
 from fastapi.staticfiles import StaticFiles
 
+from db.repository import HumanActorRequired
 from db.supabase_client import close_pool, db_available
 from routers import admin, applications, candidates, dashboard, emails, jobs, jd_generation, sourcing, website
 from services.auth import bind_request_context
@@ -69,6 +71,12 @@ app.add_middleware(
     allow_methods=["*"],
     allow_headers=["*"],
 )
+
+@app.exception_handler(HumanActorRequired)
+async def _human_actor_required(request: Request, exc: HumanActorRequired):
+    # A solely-automated adverse decision was attempted — refuse it.
+    return JSONResponse(status_code=403, content={"detail": str(exc)})
+
 
 app.include_router(jobs.router)
 app.include_router(candidates.router)

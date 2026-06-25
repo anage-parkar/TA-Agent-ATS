@@ -19,6 +19,7 @@ from fastapi import APIRouter, File, Form, HTTPException, Request, UploadFile
 
 from db import repository
 from models.candidate import ApplicantSubmission
+from services import events
 from services.applicants import ingest_applicant
 from services.config import settings
 
@@ -181,3 +182,26 @@ async def webhook_receive(request: Request):
 
     result = ingest_applicant(job["id"], submission, source="linkedin_apply_connect")
     return {"ok": True, **result}
+
+
+# ── Candidate transparency: request human review of an automated outcome ──
+@router.post("/api/applications/{application_id}/request-human-review")
+def request_human_review(application_id: str):
+    """Public, candidate-facing: ask a human to review this application.
+
+    Flags the application for the recruiter's review queue and records a
+    candidate-actor event. Part of the human-oversight / transparency guarantee
+    (ties to Workstream F candidate transparency). Never rejects anything.
+    """
+    detail = repository.get_application_detail(application_id)
+    if not detail:
+        raise HTTPException(status_code=404, detail="Application not found")
+    repository.update_application(application_id, {"human_review_requested": True})
+    events.emit_event(
+        "candidate.requested_human_review",
+        entity_type="application",
+        entity_id=application_id,
+        actor_type="candidate",
+        actor_id=None,
+    )
+    return {"ok": True, "application_id": application_id, "human_review_requested": True}
