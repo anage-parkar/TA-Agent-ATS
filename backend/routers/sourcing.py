@@ -9,9 +9,10 @@ from __future__ import annotations
 
 import logging
 
-from fastapi import APIRouter, HTTPException
+from fastapi import APIRouter, Depends, HTTPException
 
 from db import repository
+from services.rbac import require_permission
 from models.candidate import ApplicantSubmission
 from models.sourcing import FormsSyncRequest, TalentHuntRequest
 from services import forms_sync, talent_hunt
@@ -23,7 +24,7 @@ logger = logging.getLogger("ta_agent.routers.sourcing")
 router = APIRouter(prefix="/api/jobs", tags=["sourcing"])
 
 
-@router.post("/{job_id}/talent-hunt")
+@router.post("/{job_id}/talent-hunt", dependencies=[Depends(require_permission("candidate.source"))])
 def run_talent_hunt(job_id: str, req: TalentHuntRequest):
     """Outbound search by skills/role/experience/location → source=talent_hunt."""
     job = repository.get_job(job_id)
@@ -57,7 +58,7 @@ def run_talent_hunt(job_id: str, req: TalentHuntRequest):
     }
 
 
-@router.post("/{job_id}/sync-forms")
+@router.post("/{job_id}/sync-forms", dependencies=[Depends(require_permission("candidate.source"))])
 def sync_forms(job_id: str, req: FormsSyncRequest):
     """Pull responses from THIS job's linked Google Form → source=google_form.
 

@@ -11,11 +11,12 @@ import json
 import logging
 from typing import Optional
 
-from fastapi import APIRouter, File, Form, HTTPException, UploadFile
+from fastapi import APIRouter, Depends, File, Form, HTTPException, UploadFile
 
 from db import repository
 from models.candidate import ApplicantSubmission
 from services import ceipal_ats, website
+from services.rbac import require_permission
 from services.applicants import ingest_applicant
 
 logger = logging.getLogger("ta_agent.routers.website")
@@ -23,7 +24,7 @@ logger = logging.getLogger("ta_agent.routers.website")
 router = APIRouter(prefix="/api/website", tags=["website"])
 
 
-@router.post("/sync-jobs")
+@router.post("/sync-jobs", dependencies=[Depends(require_permission("job.sync"))])
 def sync_jobs():
     """Pull active jobs from the careers site and upsert them as website jobs."""
     try:
@@ -48,7 +49,7 @@ def sync_jobs():
     return {"count": len(synced), "jobs": synced}
 
 
-@router.post("/sync-applicants")
+@router.post("/sync-applicants", dependencies=[Depends(require_permission("candidate.source"))])
 def sync_applicants():
     """Option B — pull applicants from Ceipal's ATS API into the Website channel.
 

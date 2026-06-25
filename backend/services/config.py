@@ -32,14 +32,35 @@ class Settings(BaseSettings):
         extra="ignore",
     )
 
-    # LLM — Claude Code CLI (Max plan), driven headless via `claude -p`.
-    # Model is a CLI alias: 'sonnet' | 'opus' | 'haiku', or a full model id.
+    # LLM gateway — provider is config-only (Engineering Rule 1).
+    #   api → AnthropicAPIProvider (Anthropic Console API key) — production default
+    #   cli → CLIProvider (Claude Code CLI, Max-plan OAuth) — local dev ONLY
+    llm_provider: str = "api"
+    anthropic_api_key: str = ""  # required when llm_provider="api"
+    # Model alias: 'sonnet' | 'opus' | 'haiku', or a full model id. Mapped to
+    # current model ids in services.llm.base.API_MODEL_ALIASES for the API.
     llm_model: str = "sonnet"
+    # Anthropic SDK call tuning.
+    llm_max_retries: int = 2   # SDK retries 429/5xx/connection errors w/ backoff
+    llm_timeout: int = 120     # seconds per API request
+    # Per-tenant rate cap (LLM calls/min). 0 = disabled. Wire higher in prod.
+    llm_rate_limit_per_min: int = 0
+
+    # CLI provider (dev only) settings.
     claude_bin: str = ""  # optional: full path to the claude executable
     llm_step_timeout: int = 180  # seconds per headless `claude -p` call
-    # Max concurrent `claude -p` calls. The Max plan limits concurrent CLI
-    # sessions; too many at once causes calls to queue and time out. 3 is safe.
+    # Max concurrent gateway calls for fan-out (e.g. scoring N candidates).
     llm_max_concurrency: int = 3
+
+    # Multi-tenancy (Workstream A). The seeded default org/user keeps the
+    # single-tenant local flow working before real login exists; the request
+    # context falls back to these when no auth headers are present.
+    default_tenant_id: str = "00000000-0000-0000-0000-000000000001"
+    default_user_id: str = "00000000-0000-0000-0000-000000000002"
+    # Trust X-User-Role / X-Tenant-Id / X-User-Id request headers to resolve the
+    # principal. TRUE only because a trusted front door / dev is the caller; set
+    # FALSE once real authenticated sessions land (Workstream A auth roadmap).
+    trust_auth_headers: bool = True
 
     # Database
     database_url: str = "postgresql://postgres:localpassword@localhost:5432/ta_agent"

@@ -6,24 +6,26 @@ import json
 import logging
 from concurrent.futures import ThreadPoolExecutor
 
-from fastapi import APIRouter, HTTPException
+from fastapi import APIRouter, Body, Depends, HTTPException
 
+from services.rbac import require_permission
 from agents.jd_parser import parse_job
 from agents.scoring import score_candidate
 from db import repository
 from services import linkedin_enrich
 from models.candidate import CandidateProfile
 from models.job import JobSyncRequest, parsed_from_record
-from services import linkedin
+from services import events, linkedin
 from services.config import settings
 from services.llm_client import LLMError
+from services.tenant_context import get_principal, use_principal
 
 logger = logging.getLogger("ta_agent.routers.jobs")
 
 router = APIRouter(prefix="/api/jobs", tags=["jobs"])
 
 
-@router.post("/sync")
+@router.post("/sync", dependencies=[Depends(require_permission("job.sync"))])
 def sync_job(req: JobSyncRequest):
     """Fetch a LinkedIn job post, parse it, and store the structured result."""
     try:
@@ -64,7 +66,7 @@ def sync_job(req: JobSyncRequest):
     return {"job_id": job["id"], "parsed_fields": parsed.model_dump()}
 
 
-@router.post("/ensure")
+@router.post("/ensure", dependencies=[Depends(require_permission("job.create"))])
 def ensure_job(payload: dict):
     """Find-or-create a job by typed title; returns its id.
 
@@ -91,7 +93,7 @@ def get_job(job_id: str):
     return job
 
 
-@router.post("/{job_id}/score-applicants")
+@router.post("/{job_id}/score-applicants", dependencies=[Depends(require_permission("application.score"))])
 def score_applicants(job_id: str):
     """Score every not-yet-scored inbound applicant for this job.
 
@@ -110,17 +112,25 @@ def score_applicants(job_id: str):
     if not pending:
         return {"job_id": job_id, "scored": 0, "candidates": [], "detail": "No unscored applicants."}
 
+    # Worker threads don't inherit the request contextvar, so capture the
+    # principal here and rebind it inside each worker (keeps tenant scoping +
+    # usage attribution correct for the gateway call).
+    principal = get_principal()
+
     def _score(app):
         cand = app.get("candidate") or {}
         try:
-            profile = CandidateProfile.model_validate(cand)
-            # Enrich from LinkedIn (cached if already done) and factor it in.
-            enrichment = linkedin_enrich.get_or_create_enrichment(cand)
-            breakdown = score_candidate(parsed, profile, enrichment=enrichment)
-            return app, profile, breakdown
+            with use_principal(principal):
+                profile = CandidateProfile.model_validate(cand)
+                # Enrich from LinkedIn (cached if already done) and factor it in.
+                enrichment = linkedin_enrich.get_or_create_enrichment(cand)
+                breakdown, meta = score_candidate(
+                    parsed, profile, enrichment=enrichment, with_meta=True
+                )
+            return app, profile, breakdown, meta
         except (LLMError, Exception) as exc:  # noqa: BLE001
             logger.error("Scoring failed for application %s: %s", app.get("id"), exc)
-            return app, None, None
+            return app, None, None, None
 
     with ThreadPoolExecutor(
         max_workers=min(settings.llm_max_concurrency, len(pending))
@@ -128,7 +138,7 @@ def score_applicants(job_id: str):
         scored = list(pool.map(_score, pending))
 
     results = []
-    for app, profile, breakdown in scored:
+    for app, profile, breakdown, meta in scored:
         if breakdown is None:
             continue
         repository.update_application(
@@ -138,6 +148,31 @@ def score_applicants(job_id: str):
                 "ats_breakdown": json.dumps(breakdown.model_dump()),
                 "status": "scored",
             },
+        )
+        # Persist the explainable AI decision (versions + evidence) and emit a
+        # domain event — main thread, so the tenant context is correct.
+        repository.create_ai_decision(
+            {
+                "application_id": app["id"],
+                "candidate_id": app.get("candidate_id"),
+                "job_id": job_id,
+                "kind": "ats_score",
+                "model_version": meta.model_version,
+                "prompt_name": meta.prompt_name,
+                "prompt_version": meta.prompt_version,
+                "prompt_hash": meta.prompt_hash,
+                "input_hash": meta.input_hash,
+                "scores": breakdown.model_dump(),
+                "evidence": {"reasoning": breakdown.reasoning},
+            }
+        )
+        events.emit_event(
+            "candidate.scored",
+            entity_type="application",
+            entity_id=app["id"],
+            actor_type="ai",
+            actor_id="scoring.ats",
+            metadata={"overall_score": breakdown.overall_score},
         )
         results.append(
             {
@@ -150,3 +185,76 @@ def score_applicants(job_id: str):
 
     results.sort(key=lambda r: r["ats_score"], reverse=True)
     return {"job_id": job_id, "scored": len(results), "candidates": results}
+
+
+@router.get("/{job_id}/review-queue")
+def review_queue(job_id: str, threshold: float = 60.0):
+    """Human review queue: scored applicants awaiting a human decision.
+
+    AI scoring ranks and surfaces — it never rejects. Sub-threshold candidates
+    land here (flagged) for a recruiter to review and act on, instead of being
+    auto-rejected. Candidates who asked for human review are flagged too.
+    """
+    apps = repository.list_applications_for_job(job_id)
+    queue = []
+    for a in apps:
+        if a.get("recruiter_decision"):
+            continue  # already decided by a human
+        if a.get("ats_score") is None:
+            continue  # not scored yet
+        score = a.get("ats_score") or 0
+        queue.append(
+            {
+                "application_id": a["id"],
+                "candidate": a.get("candidate"),
+                "ats_score": score,
+                "below_threshold": score < threshold,
+                "human_review_requested": bool(a.get("human_review_requested")),
+            }
+        )
+    queue.sort(key=lambda r: r["ats_score"])
+    return {
+        "job_id": job_id,
+        "threshold": threshold,
+        "count": len(queue),
+        "below_threshold": sum(1 for r in queue if r["below_threshold"]),
+        "queue": queue,
+    }
+
+
+@router.post("/{job_id}/bulk-reject", dependencies=[Depends(require_permission("application.decide"))])
+def bulk_reject(
+    job_id: str,
+    application_ids: list[str] | None = Body(default=None, embed=True),
+    below_threshold: float | None = Body(default=None, embed=True),
+):
+    """Reject many applicants in one human click — still a recorded human decision.
+
+    Supply explicit `application_ids`, or `below_threshold` to reject all
+    not-yet-decided, scored applicants under that score. Each rejection is
+    audited with the acting human (the rejected transition is enforced
+    human-only at the repository layer).
+    """
+    if not application_ids and below_threshold is None:
+        raise HTTPException(
+            status_code=400, detail="Provide application_ids or below_threshold."
+        )
+
+    targets = set(application_ids or [])
+    if below_threshold is not None:
+        for a in repository.list_applications_for_job(job_id):
+            if (
+                a.get("recruiter_decision") is None
+                and a.get("ats_score") is not None
+                and (a.get("ats_score") or 0) < below_threshold
+            ):
+                targets.add(a["id"])
+
+    rejected = []
+    for app_id in targets:
+        updated = repository.update_application(
+            app_id, {"status": "rejected", "recruiter_decision": "reject"}
+        )
+        if updated:
+            rejected.append(app_id)
+    return {"job_id": job_id, "rejected": len(rejected), "application_ids": rejected}

@@ -12,25 +12,9 @@ import json
 import logging
 
 from models.interview import EmailDraft
-from services.llm_client import LLMError, call_claude_json
+from services.llm import LLMError, get_gateway
 
 logger = logging.getLogger("ta_agent.agents.outreach")
-
-_PROCEED_SYSTEM = """Write a warm, professional email telling a candidate they ADVANCED to the
-next hiring stage. Keep it BRIEF — 2 short paragraphs, plain text (no signatures
-or footers; the system adds branded header/footer).
-- Address them by first name; reference the role.
-- Note 1 specific strength from their profile.
-- Ask them to reply to confirm interest in moving forward.
-- End with a brief sign-off line (e.g. "Best regards, Talent Acquisition Team").
-Return ONLY valid JSON: { "subject": string, "body": string }"""
-
-_REJECT_SYSTEM = """Write a respectful, BRIEF rejection email — 2 short paragraphs, plain text
-(no footers; the system adds branded header/footer).
-- Address them by first name; reference the role.
-- Kindly say they weren't selected to move forward; thank them; wish them well.
-- No harsh reasons. End with a brief sign-off line.
-Return ONLY valid JSON: { "subject": string, "body": string }"""
 
 
 def template_decision_email(decision: str, candidate: dict, job_title: str) -> EmailDraft:
@@ -70,7 +54,7 @@ def template_decision_email(decision: str, candidate: dict, job_title: str) -> E
 
 def draft_decision_email(decision: str, candidate: dict, job_title: str) -> EmailDraft:
     """Draft a proceed/reject email. Raises LLMError on failure/invalid output."""
-    system = _PROCEED_SYSTEM if decision == "proceed" else _REJECT_SYSTEM
+    prompt = "outreach.proceed" if decision == "proceed" else "outreach.reject"
     user = json.dumps(
         {
             "decision": decision,
@@ -85,9 +69,9 @@ def draft_decision_email(decision: str, candidate: dict, job_title: str) -> Emai
         indent=2,
     )
     try:
-        # Drafting a short email is simple — use the fast model (Haiku) to keep
-        # the Proceed/Reject click responsive.
-        data = call_claude_json(system, user, max_tokens=500, model="haiku")
+        # The prompt template pins the fast model (Haiku) so the Proceed/Reject
+        # click stays responsive.
+        data = get_gateway().complete_json(prompt=prompt, user=user)
     except LLMError:
         logger.exception("Decision email drafting failed")
         raise
