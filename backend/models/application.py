@@ -18,6 +18,22 @@ class ATSBreakdown(BaseModel):
     reasoning: str
 
 
+class DimensionScore(BaseModel):
+    """One rubric dimension: an LLM score with evidence cited from the CV."""
+
+    score: float = Field(ge=0, le=1)
+    evidence: str = ""
+
+
+class RubricScores(BaseModel):
+    """Per-dimension LLM output (Workstream D). location_match is computed
+    deterministically in code, not by the LLM, so it is not here."""
+
+    skill_match: DimensionScore
+    experience_fit: DimensionScore
+    tech_stack_overlap: DimensionScore
+
+
 class ApplicationRecord(BaseModel):
     id: str
     job_id: str
