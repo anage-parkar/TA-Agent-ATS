@@ -41,14 +41,22 @@ def _enrichment_summary(enrichment: dict) -> dict:
 
 
 def score_candidate(
-    job: ParsedJob, candidate: CandidateProfile, enrichment: dict | None = None
-) -> ATSBreakdown:
+    job: ParsedJob,
+    candidate: CandidateProfile,
+    enrichment: dict | None = None,
+    *,
+    with_meta: bool = False,
+):
     """Score one candidate against one job. Returns a validated ATSBreakdown.
 
     When `enrichment` (scraped LinkedIn profile) is supplied, the scorer factors
     in the candidate's real experience, education, certifications and skills.
 
-    Raises LLMError on CLI failure or unparseable/invalid output.
+    With `with_meta=True`, returns `(ATSBreakdown, LLMResult)` so the caller can
+    persist an ai_decisions row (model/prompt versions, input hash, evidence)
+    from a context where the request tenant is correctly bound.
+
+    Raises LLMError on model failure or unparseable/invalid output.
     """
     candidate_obj = candidate.model_dump()
     if enrichment:
@@ -56,9 +64,10 @@ def score_candidate(
 
     user = json.dumps({"job": job.model_dump(), "candidate": candidate_obj}, indent=2)
     try:
-        data = get_gateway().complete_json(prompt="scoring.ats", user=user)
+        result = get_gateway().complete_json(prompt="scoring.ats", user=user, with_meta=True)
     except LLMError:
         logger.exception("ATS scoring LLM call failed for %s", candidate.full_name)
         raise
 
-    return ATSBreakdown.model_validate(data)
+    breakdown = ATSBreakdown.model_validate(result.data)
+    return (breakdown, result) if with_meta else breakdown

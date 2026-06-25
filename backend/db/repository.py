@@ -16,12 +16,15 @@ Public signatures are identical in both modes and always return plain dicts.
 
 from __future__ import annotations
 
+import hashlib
+import json
+import re
 import uuid
 from datetime import datetime, timezone
 from typing import Any, Optional
 
 from db.supabase_client import db_available, tenant_connection
-from services.tenant_context import get_tenant_id, use_tenant
+from services.tenant_context import current_role, current_user_id, get_tenant_id, use_tenant
 
 # ── In-memory fallback store ──────────────────────────────────────────
 _jobs: dict[str, dict] = {}
@@ -30,6 +33,14 @@ _applications: dict[str, dict] = {}
 _emails: dict[str, dict] = {}
 _generated_jds: dict[str, dict] = {}
 _orgs: dict[str, dict] = {}   # control-plane (not tenant-filtered)
+# Workstream B entities
+_activity_events: dict[str, dict] = {}
+_ai_decisions: dict[str, dict] = {}
+_scorecards: dict[str, dict] = {}
+_consents: dict[str, dict] = {}
+_eeo: dict[str, dict] = {}          # segregated — never read by scoring
+_resumes: dict[str, dict] = {}
+_pipeline_stages: dict[str, dict] = {}
 
 
 def _now() -> str:
@@ -68,6 +79,63 @@ def _vals(store: dict[str, dict]) -> list[dict]:
 def _get(store: dict[str, dict], _id: str) -> Optional[dict]:
     rec = store.get(_id)
     return rec if (rec is not None and _owned(rec)) else None
+
+
+def _sha(value: str) -> str:
+    return hashlib.sha256(value.encode("utf-8")).hexdigest()
+
+
+def identity_keys(row: dict[str, Any]) -> dict[str, str]:
+    """Hashed identity signals for dedup / identity resolution.
+
+    A person is the same person across applications if any of these match.
+    Hashed so the keys can be indexed/compared without storing raw PII twice.
+    """
+    keys: dict[str, str] = {}
+    email = (row.get("email") or "").strip().lower()
+    if email:
+        keys["email_hash"] = _sha(email)
+    phone = re.sub(r"\D", "", row.get("phone") or "")
+    if len(phone) >= 7:
+        keys["phone_hash"] = _sha(phone)
+    name = re.sub(r"\s+", " ", (row.get("full_name") or "").strip().lower())
+    if name:
+        keys["name_hash"] = _sha(name)
+    return keys
+
+
+def _emit_audit(
+    action: str,
+    entity_type: str,
+    entity_id: str,
+    *,
+    before: dict | None = None,
+    after: dict | None = None,
+    actor_type: str = "human",
+    actor_id: str | None = None,
+    metadata: dict | None = None,
+) -> None:
+    """Write one append-only activity_events row for a state change.
+
+    Best-effort: an audit write must never break the underlying operation.
+    """
+    try:
+        create_activity_event(
+            {
+                "action": action,
+                "entity_type": entity_type,
+                "entity_id": str(entity_id),
+                "before": before,
+                "after": after,
+                "actor_type": actor_type,
+                "actor_id": actor_id if actor_id is not None else current_user_id(),
+                "metadata": metadata,
+            }
+        )
+    except Exception:  # noqa: BLE001
+        import logging
+
+        logging.getLogger("ta_agent.repository").exception("audit write failed for %s", action)
 
 
 # ── Jobs ──────────────────────────────────────────────────────────────
@@ -189,26 +257,44 @@ _CANDIDATE_FIELDS = (
 def upsert_candidate(data: dict[str, Any]) -> dict:
     # Only persist known columns; tolerate callers passing a subset.
     row = {k: data.get(k) for k in _CANDIDATE_FIELDS}
+    keys = identity_keys(data)   # email/phone/name hashes for identity resolution
 
     if not db_available():
-        # de-dupe on linkedin_url (when present), else on email — within tenant.
-        key = row.get("linkedin_url") or row.get("email")
-        if key:
-            for c in _vals(_candidates):
-                if (c.get("linkedin_url") or c.get("email")) == key:
-                    c.update({k: v for k, v in row.items() if v is not None})
-                    return c
-        cand = {"id": _new_id(), "created_at": _now(), **row}
+        # Identity resolution within tenant: a person is the same person if
+        # linkedin_url, email, or any identity-key (email/phone hash) matches —
+        # so one human applying to many jobs stays ONE candidate row.
+        lk = row.get("linkedin_url")
+        em = (row.get("email") or "").strip().lower()
+        match = None
+        for c in _vals(_candidates):
+            ck = c.get("identity_keys") or {}
+            if lk and c.get("linkedin_url") == lk:
+                match = c
+            elif em and (c.get("email") or "").strip().lower() == em:
+                match = c
+            elif keys and (
+                (keys.get("email_hash") and keys["email_hash"] == ck.get("email_hash"))
+                or (keys.get("phone_hash") and keys["phone_hash"] == ck.get("phone_hash"))
+            ):
+                match = c
+            if match:
+                break
+        if match:
+            match.update({k: v for k, v in row.items() if v is not None})
+            match["identity_keys"] = {**(match.get("identity_keys") or {}), **keys}
+            return match
+        cand = {"id": _new_id(), "created_at": _now(), "identity_keys": keys, **row}
         return _put(_candidates, cand)
 
+    row_db = {**row, "identity_keys": json.dumps(keys) if keys else None}
     insert_sql = """
         insert into candidates
           (full_name, linkedin_url, email, phone, headline, skills,
-           experience_years, location, resume_url, raw_profile)
+           experience_years, location, resume_url, raw_profile, identity_keys)
         values
           (%(full_name)s, %(linkedin_url)s, %(email)s, %(phone)s,
            %(headline)s, %(skills)s, %(experience_years)s, %(location)s,
-           %(resume_url)s, %(raw_profile)s)
+           %(resume_url)s, %(raw_profile)s, %(identity_keys)s::jsonb)
     """
     with tenant_connection() as conn:
         if row.get("linkedin_url"):
@@ -220,10 +306,11 @@ def upsert_candidate(data: dict[str, Any]) -> dict:
                   skills = excluded.skills,
                   email = coalesce(excluded.email, candidates.email),
                   phone = coalesce(excluded.phone, candidates.phone),
-                  resume_url = coalesce(excluded.resume_url, candidates.resume_url)
+                  resume_url = coalesce(excluded.resume_url, candidates.resume_url),
+                  identity_keys = coalesce(excluded.identity_keys, candidates.identity_keys)
                 returning *
                 """,
-                row,
+                row_db,
             )
             return _row(cur)
 
@@ -254,7 +341,7 @@ def upsert_candidate(data: dict[str, Any]) -> dict:
                 )
                 return _row(cur)
 
-        cur = conn.execute(insert_sql + " returning *", row)
+        cur = conn.execute(insert_sql + " returning *", row_db)
         return _row(cur)
 
 
@@ -307,7 +394,14 @@ def create_application(data: dict[str, Any]) -> dict:
             "updated_at": _now(),
             **data,
         }
-        return _put(_applications, app)
+        created = _put(_applications, app)
+        _emit_audit(
+            "application.created", "application", created["id"],
+            actor_type="system",
+            after={"status": created.get("status"), "stage": created.get("stage"),
+                   "source": created.get("source")},
+        )
+        return created
 
     with tenant_connection() as conn:
         cur = conn.execute(
@@ -331,7 +425,15 @@ def create_application(data: dict[str, Any]) -> dict:
                 **data,
             },
         )
-        return _row(cur)
+        created = _row(cur)
+        if created:
+            _emit_audit(
+                "application.created", "application", created["id"],
+                actor_type="system",
+                after={"status": created.get("status"), "stage": created.get("stage"),
+                       "source": created.get("source")},
+            )
+        return created
 
 
 def list_applications_for_job(job_id: str) -> list[dict]:
@@ -639,21 +741,255 @@ def get_generated_jd(jd_id: str) -> Optional[dict]:
 
 
 def update_application(app_id: str, fields: dict[str, Any]) -> Optional[dict]:
+    # Capture the prior values of the fields being changed, for the audit trail.
+    _audit_keys = [k for k in fields if k in ("status", "stage", "recruiter_decision")]
+
     if not db_available():
         app = _get(_applications, app_id)
         if not app:
             return None
+        before = {k: app.get(k) for k in _audit_keys}
         app.update(fields)
         app["updated_at"] = _now()
+        if _audit_keys:
+            _emit_audit(
+                "application.updated", "application", app_id,
+                before=before, after={k: app.get(k) for k in _audit_keys},
+            )
         return app
 
     sets = ", ".join(f"{k} = %({k})s" for k in fields)
     with tenant_connection() as conn:
+        before = None
+        if _audit_keys:
+            prior = _row(conn.execute("select * from applications where id = %s", (app_id,)))
+            before = {k: (prior or {}).get(k) for k in _audit_keys}
         cur = conn.execute(
             f"update applications set {sets} where id = %(id)s returning *",
             {**fields, "id": app_id},
         )
+        updated = _row(cur)
+        if updated and _audit_keys:
+            _emit_audit(
+                "application.updated", "application", app_id,
+                before=before, after={k: updated.get(k) for k in _audit_keys},
+            )
+        return updated
+
+
+# ── Activity / audit events (append-only) ─────────────────────────────
+def create_activity_event(data: dict[str, Any]) -> dict:
+    payload = {
+        "actor_type": data.get("actor_type", "system"),
+        "actor_id": data.get("actor_id"),
+        "action": data["action"],
+        "entity_type": data.get("entity_type"),
+        "entity_id": data.get("entity_id"),
+        "before": data.get("before"),
+        "after": data.get("after"),
+        "metadata": data.get("metadata"),
+    }
+    if not db_available():
+        ev = {"id": _new_id(), "created_at": _now(), **payload}
+        return _put(_activity_events, ev)
+    with tenant_connection() as conn:
+        cur = conn.execute(
+            """
+            insert into activity_events
+              (actor_type, actor_id, action, entity_type, entity_id, before, after, metadata)
+            values
+              (%(actor_type)s, %(actor_id)s, %(action)s, %(entity_type)s, %(entity_id)s,
+               %(before)s::jsonb, %(after)s::jsonb, %(metadata)s::jsonb)
+            returning *
+            """,
+            {
+                **payload,
+                "before": json.dumps(payload["before"]) if payload["before"] is not None else None,
+                "after": json.dumps(payload["after"]) if payload["after"] is not None else None,
+                "metadata": json.dumps(payload["metadata"]) if payload["metadata"] is not None else None,
+            },
+        )
         return _row(cur)
+
+
+def list_activity_events(
+    entity_type: str | None = None, entity_id: str | None = None
+) -> list[dict]:
+    if not db_available():
+        out = [
+            e for e in _vals(_activity_events)
+            if (entity_type is None or e.get("entity_type") == entity_type)
+            and (entity_id is None or e.get("entity_id") == str(entity_id))
+        ]
+        return sorted(out, key=lambda e: e.get("created_at") or "")
+    clauses, params = [], {}
+    if entity_type is not None:
+        clauses.append("entity_type = %(et)s")
+        params["et"] = entity_type
+    if entity_id is not None:
+        clauses.append("entity_id = %(eid)s")
+        params["eid"] = str(entity_id)
+    where = (" where " + " and ".join(clauses)) if clauses else ""
+    with tenant_connection() as conn:
+        cur = conn.execute(f"select * from activity_events{where} order by created_at", params)
+        return _rows(cur)
+
+
+# ── AI decisions (explainable, versioned) ─────────────────────────────
+_AI_DECISION_FIELDS = (
+    "application_id", "candidate_id", "job_id", "kind", "model_version",
+    "prompt_name", "prompt_version", "prompt_hash", "input_hash", "decision",
+    "reviewer_id", "reviewed_at",
+)
+
+
+def create_ai_decision(data: dict[str, Any]) -> dict:
+    if not db_available():
+        rec = {"id": _new_id(), "created_at": _now(),
+               "scores": data.get("scores"), "evidence": data.get("evidence"),
+               **{k: data.get(k) for k in _AI_DECISION_FIELDS}}
+        return _put(_ai_decisions, rec)
+    with tenant_connection() as conn:
+        cur = conn.execute(
+            """
+            insert into ai_decisions
+              (application_id, candidate_id, job_id, kind, model_version, prompt_name,
+               prompt_version, prompt_hash, input_hash, scores, evidence, decision,
+               reviewer_id, reviewed_at)
+            values
+              (%(application_id)s, %(candidate_id)s, %(job_id)s, %(kind)s, %(model_version)s,
+               %(prompt_name)s, %(prompt_version)s, %(prompt_hash)s, %(input_hash)s,
+               %(scores)s::jsonb, %(evidence)s::jsonb, %(decision)s, %(reviewer_id)s, %(reviewed_at)s)
+            returning *
+            """,
+            {
+                **{k: data.get(k) for k in _AI_DECISION_FIELDS},
+                "scores": json.dumps(data.get("scores")) if data.get("scores") is not None else None,
+                "evidence": json.dumps(data.get("evidence")) if data.get("evidence") is not None else None,
+            },
+        )
+        return _row(cur)
+
+
+def list_ai_decisions_for_application(application_id: str) -> list[dict]:
+    if not db_available():
+        return sorted(
+            [d for d in _vals(_ai_decisions) if d.get("application_id") == application_id],
+            key=lambda d: d.get("created_at") or "",
+        )
+    with tenant_connection() as conn:
+        cur = conn.execute(
+            "select * from ai_decisions where application_id = %s order by created_at",
+            (application_id,),
+        )
+        return _rows(cur)
+
+
+# ── Scorecards / consent / EEO / resumes / pipeline stages ─────────────
+def _simple_insert(table: str, store: dict, fields: tuple, jsonb_fields: tuple, data: dict) -> dict:
+    """Insert helper for the straightforward tenant tables."""
+    if not db_available():
+        rec = {"id": _new_id(), "created_at": _now(), **{k: data.get(k) for k in fields}}
+        return _put(store, rec)
+    cols = ", ".join(fields)
+    vals = ", ".join(
+        f"%({k})s::jsonb" if k in jsonb_fields else f"%({k})s" for k in fields
+    )
+    params = {
+        k: (json.dumps(data.get(k)) if (k in jsonb_fields and data.get(k) is not None) else data.get(k))
+        for k in fields
+    }
+    with tenant_connection() as conn:
+        cur = conn.execute(
+            f"insert into {table} ({cols}) values ({vals}) returning *", params
+        )
+        return _row(cur)
+
+
+def create_scorecard(data: dict[str, Any]) -> dict:
+    return _simple_insert(
+        "scorecards", _scorecards,
+        ("application_id", "interviewer_id", "rubric", "ratings", "recommendation", "notes"),
+        ("rubric", "ratings"), data,
+    )
+
+
+def list_scorecards_for_application(application_id: str) -> list[dict]:
+    if not db_available():
+        return [s for s in _vals(_scorecards) if s.get("application_id") == application_id]
+    with tenant_connection() as conn:
+        cur = conn.execute(
+            "select * from scorecards where application_id = %s order by created_at",
+            (application_id,),
+        )
+        return _rows(cur)
+
+
+def create_consent(data: dict[str, Any]) -> dict:
+    return _simple_insert(
+        "consent_records", _consents,
+        ("candidate_id", "lawful_basis", "scope", "region", "granted_at", "expires_at"),
+        (), data,
+    )
+
+
+def list_consents_for_candidate(candidate_id: str) -> list[dict]:
+    if not db_available():
+        return [c for c in _vals(_consents) if c.get("candidate_id") == candidate_id]
+    with tenant_connection() as conn:
+        cur = conn.execute(
+            "select * from consent_records where candidate_id = %s order by created_at",
+            (candidate_id,),
+        )
+        return _rows(cur)
+
+
+def create_eeo_record(data: dict[str, Any]) -> dict:
+    """Voluntary diversity data — SEGREGATED. Nothing in the scoring path reads
+    this; it exists only for aggregate adverse-impact reporting (Workstream F)."""
+    return _simple_insert("eeo_records", _eeo, ("candidate_id", "data"), ("data",), data)
+
+
+def create_resume(data: dict[str, Any]) -> dict:
+    return _simple_insert(
+        "resumes", _resumes,
+        ("candidate_id", "file_url", "parsed_profile", "redacted_profile"),
+        ("parsed_profile", "redacted_profile"), data,
+    )
+
+
+def get_resume_for_candidate(candidate_id: str) -> Optional[dict]:
+    if not db_available():
+        for r in _vals(_resumes):
+            if r.get("candidate_id") == candidate_id:
+                return r
+        return None
+    with tenant_connection() as conn:
+        cur = conn.execute(
+            "select * from resumes where candidate_id = %s order by created_at desc limit 1",
+            (candidate_id,),
+        )
+        return _row(cur)
+
+
+def create_pipeline_stage(data: dict[str, Any]) -> dict:
+    return _simple_insert(
+        "pipeline_stages", _pipeline_stages,
+        ("job_id", "name", "position", "transitions"), ("transitions",), data,
+    )
+
+
+def list_pipeline_stages(job_id: str) -> list[dict]:
+    if not db_available():
+        return sorted(
+            [s for s in _vals(_pipeline_stages) if s.get("job_id") == job_id],
+            key=lambda s: s.get("position") or 0,
+        )
+    with tenant_connection() as conn:
+        cur = conn.execute(
+            "select * from pipeline_stages where job_id = %s order by position", (job_id,)
+        )
+        return _rows(cur)
 
 
 # ── Tenant data lifecycle (export / delete) ───────────────────────────
@@ -667,15 +1003,26 @@ _DOMAIN_STORES = {
     "applications": _applications,
     "emails": _emails,
     "generated_jds": _generated_jds,
+    "activity_events": _activity_events,
+    "ai_decisions": _ai_decisions,
+    "scorecards": _scorecards,
+    "consent_records": _consents,
+    "eeo_records": _eeo,
+    "resumes": _resumes,
+    "pipeline_stages": _pipeline_stages,
 }
 # DB delete order respects FK dependencies (children first).
 _DELETE_ORDER = (
+    "activity_events", "ai_decisions", "scorecards", "consent_records",
+    "eeo_records", "resumes", "pipeline_stages",
     "applications", "emails", "interviews", "job_members",
     "generated_jds", "candidates", "jobs",
 )
 _EXPORT_TABLES = (
     "jobs", "candidates", "applications", "emails", "interviews",
     "generated_jds", "job_members", "memberships",
+    "pipeline_stages", "activity_events", "ai_decisions", "scorecards",
+    "consent_records", "eeo_records", "resumes",
 )
 
 

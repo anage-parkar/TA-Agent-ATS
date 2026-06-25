@@ -15,9 +15,10 @@ from db import repository
 from services import linkedin_enrich
 from models.candidate import CandidateProfile
 from models.job import JobSyncRequest, parsed_from_record
-from services import linkedin
+from services import events, linkedin
 from services.config import settings
 from services.llm_client import LLMError
+from services.tenant_context import get_principal, use_principal
 
 logger = logging.getLogger("ta_agent.routers.jobs")
 
@@ -111,17 +112,25 @@ def score_applicants(job_id: str):
     if not pending:
         return {"job_id": job_id, "scored": 0, "candidates": [], "detail": "No unscored applicants."}
 
+    # Worker threads don't inherit the request contextvar, so capture the
+    # principal here and rebind it inside each worker (keeps tenant scoping +
+    # usage attribution correct for the gateway call).
+    principal = get_principal()
+
     def _score(app):
         cand = app.get("candidate") or {}
         try:
-            profile = CandidateProfile.model_validate(cand)
-            # Enrich from LinkedIn (cached if already done) and factor it in.
-            enrichment = linkedin_enrich.get_or_create_enrichment(cand)
-            breakdown = score_candidate(parsed, profile, enrichment=enrichment)
-            return app, profile, breakdown
+            with use_principal(principal):
+                profile = CandidateProfile.model_validate(cand)
+                # Enrich from LinkedIn (cached if already done) and factor it in.
+                enrichment = linkedin_enrich.get_or_create_enrichment(cand)
+                breakdown, meta = score_candidate(
+                    parsed, profile, enrichment=enrichment, with_meta=True
+                )
+            return app, profile, breakdown, meta
         except (LLMError, Exception) as exc:  # noqa: BLE001
             logger.error("Scoring failed for application %s: %s", app.get("id"), exc)
-            return app, None, None
+            return app, None, None, None
 
     with ThreadPoolExecutor(
         max_workers=min(settings.llm_max_concurrency, len(pending))
@@ -129,7 +138,7 @@ def score_applicants(job_id: str):
         scored = list(pool.map(_score, pending))
 
     results = []
-    for app, profile, breakdown in scored:
+    for app, profile, breakdown, meta in scored:
         if breakdown is None:
             continue
         repository.update_application(
@@ -139,6 +148,31 @@ def score_applicants(job_id: str):
                 "ats_breakdown": json.dumps(breakdown.model_dump()),
                 "status": "scored",
             },
+        )
+        # Persist the explainable AI decision (versions + evidence) and emit a
+        # domain event — main thread, so the tenant context is correct.
+        repository.create_ai_decision(
+            {
+                "application_id": app["id"],
+                "candidate_id": app.get("candidate_id"),
+                "job_id": job_id,
+                "kind": "ats_score",
+                "model_version": meta.model_version,
+                "prompt_name": meta.prompt_name,
+                "prompt_version": meta.prompt_version,
+                "prompt_hash": meta.prompt_hash,
+                "input_hash": meta.input_hash,
+                "scores": breakdown.model_dump(),
+                "evidence": {"reasoning": breakdown.reasoning},
+            }
+        )
+        events.emit_event(
+            "candidate.scored",
+            entity_type="application",
+            entity_id=app["id"],
+            actor_type="ai",
+            actor_id="scoring.ats",
+            metadata={"overall_score": breakdown.overall_score},
         )
         results.append(
             {
