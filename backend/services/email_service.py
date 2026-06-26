@@ -60,7 +60,9 @@ def _service():
     return build("gmail", "v1", credentials=creds, cache_discovery=False)
 
 
-def send_email(to: str, subject: str, body: str, decision: str = "proceed") -> dict:
+def send_email(
+    to: str, subject: str, body: str, decision: str = "proceed", opt_out_url: str | None = None
+) -> dict:
     """Send a branded HTML email (with plain-text fallback) from the recruiter's
     Gmail. Returns {thread_id, message_id}."""
     ok, reason = availability()
@@ -71,8 +73,8 @@ def send_email(to: str, subject: str, body: str, decision: str = "proceed") -> d
     msg["to"] = to
     msg["from"] = settings.outreach_from_email or "me"
     msg["subject"] = subject
-    msg.attach(MIMEText(email_templates.plain_fallback(body), "plain", "utf-8"))
-    msg.attach(MIMEText(email_templates.render_html(body, decision), "html", "utf-8"))
+    msg.attach(MIMEText(email_templates.plain_fallback(body, opt_out_url), "plain", "utf-8"))
+    msg.attach(MIMEText(email_templates.render_html(body, decision, opt_out_url), "html", "utf-8"))
     raw = base64.urlsafe_b64encode(msg.as_bytes()).decode()
 
     sent = _service().users().messages().send(userId="me", body={"raw": raw}).execute()

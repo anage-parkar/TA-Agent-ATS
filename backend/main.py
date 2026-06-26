@@ -18,7 +18,7 @@ from fastapi.staticfiles import StaticFiles
 
 from db.repository import HumanActorRequired
 from db.supabase_client import close_pool, db_available
-from routers import admin, applications, candidates, dashboard, emails, jobs, jd_generation, legal, sourcing, website
+from routers import admin, applications, candidates, dashboard, emails, interviews, jobs, jd_generation, legal, sourcing, website
 from services.auth import bind_request_context
 from services.llm import get_gateway
 
@@ -88,6 +88,7 @@ app.include_router(emails.router)
 app.include_router(jd_generation.router)
 app.include_router(admin.router)
 app.include_router(legal.router)
+app.include_router(interviews.router)
 
 # Serve uploaded files (resumes + generated JD PDFs).
 _uploads = Path(__file__).resolve().parent / "uploads"

@@ -258,3 +258,18 @@ def record_eeo(application_id: str, payload: dict = Body(...)):
     candidate_id = detail.get("candidate_id") or (detail.get("candidate") or {}).get("id")
     repository.create_eeo_record({"candidate_id": candidate_id, "data": payload.get("data") or payload})
     return {"ok": True, "message": "Thank you. This information is voluntary and is never used to evaluate your application."}
+
+
+@router.get("/api/applications/{application_id}/opt-out")
+def opt_out(application_id: str):
+    """Public GDPR opt-out (target of the unsubscribe link in every email)."""
+    detail = repository.get_application_detail(application_id)
+    if not detail:
+        raise HTTPException(status_code=404, detail="Application not found")
+    candidate_id = detail.get("candidate_id") or (detail.get("candidate") or {}).get("id")
+    repository.set_candidate_opt_out(candidate_id, True)
+    events.emit_event(
+        "candidate.opted_out", entity_type="candidate", entity_id=candidate_id,
+        actor_type="candidate",
+    )
+    return {"ok": True, "message": "You have been opted out of further communications."}

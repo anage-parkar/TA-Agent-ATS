@@ -55,6 +55,7 @@ _consents: dict[str, dict] = {}
 _eeo: dict[str, dict] = {}          # segregated — never read by scoring
 _resumes: dict[str, dict] = {}
 _pipeline_stages: dict[str, dict] = {}
+_interviews: dict[str, dict] = {}
 
 
 def _now() -> str:
@@ -1035,6 +1036,7 @@ _DOMAIN_STORES = {
     "eeo_records": _eeo,
     "resumes": _resumes,
     "pipeline_stages": _pipeline_stages,
+    "interviews": _interviews,
 }
 # DB delete order respects FK dependencies (children first).
 _DELETE_ORDER = (
@@ -1180,11 +1182,12 @@ def erase_candidate(candidate_id: str) -> dict[str, int]:
         apps = [a for a in _vals(_applications) if a.get("candidate_id") == candidate_id]
         app_ids = {a["id"] for a in apps}
         deleted = {"applications": 0, "emails": 0, "ai_decisions": 0,
-                   "scorecards": 0, "consent_records": 0, "eeo_records": 0,
-                   "resumes": 0, "candidate": 0}
+                   "scorecards": 0, "interviews": 0, "consent_records": 0,
+                   "eeo_records": 0, "resumes": 0, "candidate": 0}
         for store, key, name in (
             (_emails, "application_id", "emails"),
             (_scorecards, "application_id", "scorecards"),
+            (_interviews, "application_id", "interviews"),
         ):
             for k in [k for k, v in store.items() if v.get(key) in app_ids]:
                 del store[k]; deleted[name] += 1
@@ -1238,3 +1241,44 @@ def list_eeo_records() -> list[dict]:
         return list(_vals(_eeo))
     with tenant_connection() as conn:
         return _rows(conn.execute("select * from eeo_records"))
+
+
+# ── Engagement: opt-out + interviews (Workstream G) ───────────────────
+def set_candidate_opt_out(candidate_id: str, opted_out: bool = True) -> Optional[dict]:
+    """Record a candidate's communication opt-out (GDPR). Excludes them from sends."""
+    if not db_available():
+        cand = _get(_candidates, candidate_id)
+        if cand:
+            cand["opted_out"] = opted_out
+            cand["opted_out_at"] = _now() if opted_out else None
+        return cand
+    with tenant_connection() as conn:
+        cur = conn.execute(
+            "update candidates set opted_out = %s, opted_out_at = case when %s then now() else null end "
+            "where id = %s returning *",
+            (opted_out, opted_out, candidate_id),
+        )
+        return _row(cur)
+
+
+def create_interview(data: dict[str, Any]) -> dict:
+    return _simple_insert(
+        "interviews", _interviews,
+        ("application_id", "stage", "scheduled_at", "duration_minutes", "format",
+         "interviewer_email", "calendar_event_id", "confirmation_status"),
+        (), data,
+    )
+
+
+def list_interviews_for_application(application_id: str) -> list[dict]:
+    if not db_available():
+        return sorted(
+            [i for i in _vals(_interviews) if i.get("application_id") == application_id],
+            key=lambda i: i.get("created_at") or "",
+        )
+    with tenant_connection() as conn:
+        cur = conn.execute(
+            "select * from interviews where application_id = %s order by created_at",
+            (application_id,),
+        )
+        return _rows(cur)
