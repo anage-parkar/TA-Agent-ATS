@@ -55,6 +55,7 @@ _consents: dict[str, dict] = {}
 _eeo: dict[str, dict] = {}          # segregated — never read by scoring
 _resumes: dict[str, dict] = {}
 _pipeline_stages: dict[str, dict] = {}
+_interviews: dict[str, dict] = {}
 
 
 def _now() -> str:
@@ -1064,6 +1065,7 @@ _DOMAIN_STORES = {
     "eeo_records": _eeo,
     "resumes": _resumes,
     "pipeline_stages": _pipeline_stages,
+    "interviews": _interviews,
 }
 # DB delete order respects FK dependencies (children first).
 _DELETE_ORDER = (
@@ -1129,3 +1131,183 @@ def create_organization(name: str, slug: str | None = None, region: str = "globa
             (name, slug, region),
         )
         return _row(cur)
+
+
+_ORG_FIELDS = ("name", "region", "retention_days", "ai_disclosure", "privacy_notice_url")
+
+
+def get_organization(tenant_id: str | None = None) -> Optional[dict]:
+    tid = tenant_id or get_tenant_id()
+    if not db_available():
+        if tid in _orgs:
+            return _orgs[tid]
+        return {"id": tid, "name": "Default Organization", "region": "global",
+                "retention_days": None, "ai_disclosure": None, "privacy_notice_url": None}
+    with tenant_connection() as conn:
+        cur = conn.execute("select * from organizations where id = %s", (tid,))
+        return _row(cur)
+
+
+def update_organization(tenant_id: str, fields: dict[str, Any]) -> Optional[dict]:
+    allowed = {k: v for k, v in fields.items() if k in _ORG_FIELDS}
+    if not allowed:
+        return get_organization(tenant_id)
+    if not db_available():
+        org = _orgs.get(tenant_id) or get_organization(tenant_id)
+        org.update(allowed)
+        _orgs[tenant_id] = org
+        return org
+    sets = ", ".join(f"{k} = %({k})s" for k in allowed)
+    with tenant_connection() as conn:
+        cur = conn.execute(
+            f"update organizations set {sets} where id = %(id)s returning *",
+            {**allowed, "id": tenant_id},
+        )
+        return _row(cur)
+
+
+# ── Per-candidate lifecycle (DSAR export / right-to-erasure) ───────────
+def export_candidate(candidate_id: str) -> Optional[dict]:
+    """All data held about one candidate (portability / subject access request)."""
+    cand = get_candidate(candidate_id)
+    if not cand:
+        return None
+    if not db_available():
+        apps = [a for a in _vals(_applications) if a.get("candidate_id") == candidate_id]
+        app_ids = {a["id"] for a in apps}
+        return {
+            "candidate": cand,
+            "applications": apps,
+            "emails": [e for e in _vals(_emails) if e.get("application_id") in app_ids],
+            "ai_decisions": [d for d in _vals(_ai_decisions) if d.get("candidate_id") == candidate_id],
+            "consent_records": [c for c in _vals(_consents) if c.get("candidate_id") == candidate_id],
+            "eeo_records": [r for r in _vals(_eeo) if r.get("candidate_id") == candidate_id],
+            "resumes": [r for r in _vals(_resumes) if r.get("candidate_id") == candidate_id],
+        }
+    out = {"candidate": cand}
+    with tenant_connection() as conn:
+        out["applications"] = _rows(conn.execute(
+            "select * from applications where candidate_id = %s", (candidate_id,)))
+        out["emails"] = _rows(conn.execute(
+            "select e.* from emails e join applications a on a.id = e.application_id "
+            "where a.candidate_id = %s", (candidate_id,)))
+        for tbl in ("ai_decisions", "consent_records", "eeo_records", "resumes"):
+            out[tbl] = _rows(conn.execute(
+                f"select * from {tbl} where candidate_id = %s", (candidate_id,)))
+    return out
+
+
+def erase_candidate(candidate_id: str) -> dict[str, int]:
+    """Right-to-erasure: delete a candidate and all their data (tenant-scoped).
+
+    The append-only activity_events audit trail is retained (entity_id is a
+    plain reference, not an FK) and an erasure event is recorded.
+    """
+    cand = get_candidate(candidate_id)
+    if not cand:
+        return {"candidate": 0}
+
+    if not db_available():
+        apps = [a for a in _vals(_applications) if a.get("candidate_id") == candidate_id]
+        app_ids = {a["id"] for a in apps}
+        deleted = {"applications": 0, "emails": 0, "ai_decisions": 0,
+                   "scorecards": 0, "interviews": 0, "consent_records": 0,
+                   "eeo_records": 0, "resumes": 0, "candidate": 0}
+        for store, key, name in (
+            (_emails, "application_id", "emails"),
+            (_scorecards, "application_id", "scorecards"),
+            (_interviews, "application_id", "interviews"),
+        ):
+            for k in [k for k, v in store.items() if v.get(key) in app_ids]:
+                del store[k]; deleted[name] += 1
+        for store, name in (
+            (_applications, "applications"), (_ai_decisions, "ai_decisions"),
+            (_consents, "consent_records"), (_eeo, "eeo_records"), (_resumes, "resumes"),
+        ):
+            for k in [k for k, v in store.items() if v.get("candidate_id") == candidate_id]:
+                del store[k]; deleted[name] += 1
+        _candidates.pop(candidate_id, None); deleted["candidate"] = 1
+        _emit_audit("candidate.erased", "candidate", candidate_id, metadata={"deleted": deleted})
+        return deleted
+
+    with tenant_connection() as conn:
+        # FK cascades from candidates → applications → emails/ai_decisions/scorecards,
+        # and candidate-scoped consent/eeo/resumes also cascade on delete.
+        cur = conn.execute("delete from candidates where id = %s", (candidate_id,))
+        deleted = {"candidate": cur.rowcount}
+    _emit_audit("candidate.erased", "candidate", candidate_id, metadata={"deleted": deleted})
+    return deleted
+
+
+def delete_candidates_older_than(cutoff_iso: str) -> dict[str, int]:
+    """Retention: erase candidates created before the cutoff (tenant-scoped)."""
+    if not db_available():
+        ids = [c["id"] for c in _vals(_candidates) if (c.get("created_at") or "") < cutoff_iso]
+    else:
+        with tenant_connection() as conn:
+            ids = [r["id"] for r in _rows(conn.execute(
+                "select id from candidates where created_at < %s", (cutoff_iso,)))]
+    for cid in ids:
+        erase_candidate(cid)
+    return {"candidates_erased": len(ids)}
+
+
+def list_all_applications() -> list[dict]:
+    """All applications for the current tenant (for aggregate reporting)."""
+    if not db_available():
+        return list(_vals(_applications))
+    with tenant_connection() as conn:
+        return _rows(conn.execute("select * from applications"))
+
+
+def list_eeo_records() -> list[dict]:
+    """All EEO records for the current tenant — AGGREGATE reporting only.
+
+    EEO data is segregated and never used in scoring; this read exists solely for
+    adverse-impact analysis (services.bias), which reports group counts only.
+    """
+    if not db_available():
+        return list(_vals(_eeo))
+    with tenant_connection() as conn:
+        return _rows(conn.execute("select * from eeo_records"))
+
+
+# ── Engagement: opt-out + interviews (Workstream G) ───────────────────
+def set_candidate_opt_out(candidate_id: str, opted_out: bool = True) -> Optional[dict]:
+    """Record a candidate's communication opt-out (GDPR). Excludes them from sends."""
+    if not db_available():
+        cand = _get(_candidates, candidate_id)
+        if cand:
+            cand["opted_out"] = opted_out
+            cand["opted_out_at"] = _now() if opted_out else None
+        return cand
+    with tenant_connection() as conn:
+        cur = conn.execute(
+            "update candidates set opted_out = %s, opted_out_at = case when %s then now() else null end "
+            "where id = %s returning *",
+            (opted_out, opted_out, candidate_id),
+        )
+        return _row(cur)
+
+
+def create_interview(data: dict[str, Any]) -> dict:
+    return _simple_insert(
+        "interviews", _interviews,
+        ("application_id", "stage", "scheduled_at", "duration_minutes", "format",
+         "interviewer_email", "calendar_event_id", "confirmation_status"),
+        (), data,
+    )
+
+
+def list_interviews_for_application(application_id: str) -> list[dict]:
+    if not db_available():
+        return sorted(
+            [i for i in _vals(_interviews) if i.get("application_id") == application_id],
+            key=lambda i: i.get("created_at") or "",
+        )
+    with tenant_connection() as conn:
+        cur = conn.execute(
+            "select * from interviews where application_id = %s order by created_at",
+            (application_id,),
+        )
+        return _rows(cur)

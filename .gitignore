@@ -30,6 +30,9 @@ Thumbs.db
 # Docker volumes (named volume lives in docker, but ignore any local dumps)
 *.dump
 
+# Uploaded / generated candidate files (contain PII — never commit)
+backend/uploads/
+
 # Secrets / tokens
 *token*.json
 credentials.json

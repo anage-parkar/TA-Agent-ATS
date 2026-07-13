@@ -18,8 +18,10 @@ from services.rbac import require_permission
 from agents.outreach import draft_decision_email, template_decision_email
 from agents.response_parser import classify_reply
 from db import repository
-from services import email_service
+from services import email_service, events
+from services.config import settings
 from services.llm_client import LLMError
+from services.tenant_context import current_user_id
 
 logger = logging.getLogger("ta_agent.routers.emails")
 
@@ -73,11 +75,23 @@ def send_email(
     detail = repository.get_application_detail(application_id)
     if not detail:
         raise HTTPException(status_code=404, detail="Application not found")
-    to = (detail.get("candidate") or {}).get("email")
+    candidate_id = detail.get("candidate_id") or (detail.get("candidate") or {}).get("id")
+    candidate = repository.get_candidate(candidate_id) if candidate_id else None
+    to = (candidate or detail.get("candidate") or {}).get("email")
     if not to:
         raise HTTPException(status_code=400, detail="Candidate has no email address.")
 
-    # Record the recruiter decision.
+    # Consent-aware: never send to an opted-out candidate (GDPR).
+    if candidate and candidate.get("opted_out"):
+        raise HTTPException(
+            status_code=409, detail="Candidate has opted out of communications; not sending."
+        )
+
+    # Every outreach message carries a GDPR opt-out link.
+    opt_out_url = f"{settings.public_base_url}/api/applications/{application_id}/opt-out"
+    body_out = body if opt_out_url in body else f"{body}\n\nTo opt out of these emails: {opt_out_url}"
+
+    # Record the recruiter decision (human-gated; reject requires a human actor).
     status = "approved" if decision == "proceed" else "rejected"
     fields = {"status": status, "recruiter_decision": decision}
     if decision == "proceed":
@@ -90,7 +104,7 @@ def send_email(
     sent = False
     if ok:
         try:
-            res = email_service.send_email(to, subject, body, decision=decision)
+            res = email_service.send_email(to, subject, body_out, decision=decision, opt_out_url=opt_out_url)
             thread_id = res["thread_id"]
             sent = True
         except Exception as exc:  # noqa: BLE001
@@ -102,17 +116,25 @@ def send_email(
             "application_id": application_id,
             "direction": "outbound",
             "subject": subject,
-            "body": body,
+            "body": body_out,
             "sent_at": _now() if sent else None,
             "thread_id": thread_id,
             "intent": decision,
         }
+    )
+    # Log to the candidate timeline with the acting human recorded.
+    events.emit_event(
+        "outreach.sent",
+        entity_type="application", entity_id=application_id,
+        actor_type="human", actor_id=current_user_id(),
+        metadata={"decision": decision, "to": to, "sent": sent, "opt_out_link": opt_out_url},
     )
     return {
         "ok": True,
         "sent": sent,
         "status": status,
         "thread_id": thread_id,
+        "opt_out_url": opt_out_url,
         "detail": None if sent else reason,
     }
 

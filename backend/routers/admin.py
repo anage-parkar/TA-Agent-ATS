@@ -13,7 +13,9 @@ import logging
 from fastapi import APIRouter, Body, Depends, HTTPException
 
 from db import repository
+from services import bias, retention
 from services.rbac import require_permission
+from services.tenant_context import use_tenant
 
 logger = logging.getLogger("ta_agent.routers.admin")
 
@@ -49,3 +51,41 @@ def delete_tenant(tenant_id: str):
     deleted = repository.delete_tenant(tenant_id)
     logger.info("purged tenant %s: %s", tenant_id, deleted)
     return {"tenant_id": tenant_id, "deleted": deleted}
+
+
+@router.post("/tenants/{tenant_id}/config")
+def set_tenant_config(tenant_id: str, payload: dict = Body(...)):
+    """Set per-tenant compliance config: retention_days, ai_disclosure,
+    privacy_notice_url, region (data residency)."""
+    org = repository.update_organization(tenant_id, payload)
+    return {"tenant": org}
+
+
+@router.get("/tenants/{tenant_id}/adverse-impact")
+def adverse_impact(tenant_id: str, min_group: int = 5):
+    """Selection-rate / four-fifths bias report for a tenant (aggregate only)."""
+    with use_tenant(tenant_id):
+        return bias.adverse_impact(min_group=min_group)
+
+
+@router.post("/tenants/{tenant_id}/retention/run")
+def run_retention(tenant_id: str):
+    """Enforce the tenant's retention policy now (also run on a schedule)."""
+    with use_tenant(tenant_id):
+        return retention.enforce(tenant_id)
+
+
+@router.get("/candidates/{candidate_id}/export")
+def export_candidate(candidate_id: str):
+    """DSAR / portability: everything held about one candidate (tenant-scoped)."""
+    data = repository.export_candidate(candidate_id)
+    if not data:
+        raise HTTPException(status_code=404, detail="Candidate not found")
+    return {"candidate_id": candidate_id, "data": data}
+
+
+@router.delete("/candidates/{candidate_id}")
+def erase_candidate(candidate_id: str):
+    """Right-to-erasure for one candidate (tenant-scoped; audit retained)."""
+    deleted = repository.erase_candidate(candidate_id)
+    return {"candidate_id": candidate_id, "deleted": deleted}

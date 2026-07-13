@@ -38,26 +38,26 @@ def test_jd_parser_validates_parsed_job(make_gateway):
     assert job.location.remote is True
 
 
-def test_scoring_validates_ats_breakdown(make_gateway):
-    breakdown = {
-        "skill_match": 0.8,
-        "experience_fit": 0.7,
-        "location_match": 1.0,
-        "tech_stack_overlap": 0.6,
-        "overall_score": 74.5,
-        "reasoning": "Strong Python overlap.",
+def test_scoring_runs_on_redacted_profile_and_aggregates(make_gateway):
+    rubric = {
+        "skill_match": {"score": 0.8, "evidence": "Python + FastAPI"},
+        "experience_fit": {"score": 0.7, "evidence": "relevant backend work"},
+        "tech_stack_overlap": {"score": 0.6, "evidence": "overlapping stack"},
     }
-    provider = RecordingProvider(text=json.dumps(breakdown))
+    provider = RecordingProvider(text=json.dumps(rubric))
     make_gateway(provider)
 
     job = ParsedJob(title="Backend Engineer", skills_required=["Python"])
     candidate = CandidateProfile(full_name="Ada Lovelace", skills=["Python", "FastAPI"])
     result = score_candidate(job, candidate)
 
-    assert result.overall_score == 74.5
     assert result.skill_match == 0.8
-    # The scoring prompt was the one used.
-    assert "ATS scoring engine" in provider.calls[-1]["system"]
+    # overall computed from DEFAULT weights (.40/.30/.15/.15); location unknown → 0.5
+    # = (.40*.8 + .30*.7 + .15*.6 + .15*.5)*100 = 69.5
+    assert result.overall_score == 69.5
+    # The scorer only saw the REDACTED profile — the candidate's name is absent.
+    assert "Ada Lovelace" not in provider.calls[-1]["user"]
+    assert "ATS rubric scorer" in provider.calls[-1]["system"]
 
 
 def test_reply_classification(make_gateway):

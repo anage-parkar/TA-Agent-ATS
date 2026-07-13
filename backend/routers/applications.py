@@ -12,14 +12,15 @@ import json
 import logging
 import re
 import uuid
+from datetime import datetime, timezone
 from pathlib import Path
 from typing import Optional
 
-from fastapi import APIRouter, File, Form, HTTPException, Request, UploadFile
+from fastapi import APIRouter, Body, File, Form, HTTPException, Request, UploadFile
 
 from db import repository
 from models.candidate import ApplicantSubmission
-from services import events
+from services import attachments, compliance, events
 from services.applicants import ingest_applicant
 from services.config import settings
 
@@ -75,13 +76,13 @@ async def apply(
 
     resume_url = None
     if resume and resume.filename:
-        ext = Path(resume.filename).suffix.lower()
-        if ext not in _ALLOWED_RESUME_EXT:
-            raise HTTPException(status_code=400, detail=f"Unsupported resume type: {ext}")
-        fname = f"{uuid.uuid4().hex}{ext}"
         content = await resume.read()
-        if len(content) > 10 * 1024 * 1024:
-            raise HTTPException(status_code=400, detail="Resume exceeds 10 MB")
+        try:
+            # Validate type/size/magic-bytes + scan seam before it touches disk.
+            ext = attachments.validate_upload(resume.filename, content, resume.content_type)
+        except attachments.AttachmentRejected as exc:
+            raise HTTPException(status_code=400, detail=str(exc)) from exc
+        fname = f"{uuid.uuid4().hex}{ext}"   # never trust the client filename
         (UPLOAD_DIR / fname).write_bytes(content)
         resume_url = f"/uploads/resumes/{fname}"
 
@@ -205,3 +206,70 @@ def request_human_review(application_id: str):
         actor_id=None,
     )
     return {"ok": True, "application_id": application_id, "human_review_requested": True}
+
+
+@router.get("/api/applications/{application_id}/transparency")
+def transparency(application_id: str):
+    """Public: AI-use disclosure, data region, consent on file, and how to contest."""
+    detail = repository.get_application_detail(application_id)
+    if not detail:
+        raise HTTPException(status_code=404, detail="Application not found")
+    candidate_id = detail.get("candidate_id") or (detail.get("candidate") or {}).get("id")
+    org = repository.get_organization()
+    consents = repository.list_consents_for_candidate(candidate_id) if candidate_id else []
+    return {
+        "application_id": application_id,
+        **compliance.disclosure_for(org),
+        "consent_on_file": [
+            {"lawful_basis": c.get("lawful_basis"), "scope": c.get("scope"),
+             "region": c.get("region")} for c in consents
+        ],
+        "request_human_review_url": f"/api/applications/{application_id}/request-human-review",
+    }
+
+
+@router.post("/api/applications/{application_id}/consent")
+def record_consent(application_id: str, payload: dict = Body(...)):
+    """Public: candidate records consent (lawful basis / scope / region)."""
+    detail = repository.get_application_detail(application_id)
+    if not detail:
+        raise HTTPException(status_code=404, detail="Application not found")
+    candidate_id = detail.get("candidate_id") or (detail.get("candidate") or {}).get("id")
+    rec = repository.create_consent({
+        "candidate_id": candidate_id,
+        "lawful_basis": payload.get("lawful_basis", "consent"),
+        "scope": payload.get("scope"),
+        "region": payload.get("region"),
+        "granted_at": datetime.now(timezone.utc).isoformat(),
+    })
+    events.emit_event(
+        "candidate.consent_recorded", entity_type="candidate", entity_id=candidate_id,
+        actor_type="candidate", metadata={"lawful_basis": rec.get("lawful_basis")},
+    )
+    return {"ok": True, "consent": rec}
+
+
+@router.post("/api/applications/{application_id}/eeo")
+def record_eeo(application_id: str, payload: dict = Body(...)):
+    """Public: VOLUNTARY diversity data. Segregated storage — never used in scoring."""
+    detail = repository.get_application_detail(application_id)
+    if not detail:
+        raise HTTPException(status_code=404, detail="Application not found")
+    candidate_id = detail.get("candidate_id") or (detail.get("candidate") or {}).get("id")
+    repository.create_eeo_record({"candidate_id": candidate_id, "data": payload.get("data") or payload})
+    return {"ok": True, "message": "Thank you. This information is voluntary and is never used to evaluate your application."}
+
+
+@router.get("/api/applications/{application_id}/opt-out")
+def opt_out(application_id: str):
+    """Public GDPR opt-out (target of the unsubscribe link in every email)."""
+    detail = repository.get_application_detail(application_id)
+    if not detail:
+        raise HTTPException(status_code=404, detail="Application not found")
+    candidate_id = detail.get("candidate_id") or (detail.get("candidate") or {}).get("id")
+    repository.set_candidate_opt_out(candidate_id, True)
+    events.emit_event(
+        "candidate.opted_out", entity_type="candidate", entity_id=candidate_id,
+        actor_type="candidate",
+    )
+    return {"ok": True, "message": "You have been opted out of further communications."}

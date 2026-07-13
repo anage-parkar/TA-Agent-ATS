@@ -98,6 +98,9 @@ class Settings(BaseSettings):
     google_form_id: str = ""         # default Google Form id (Forms API)
     google_forms_sheet_id: str = ""  # default responses Sheet id (Sheets API)
 
+    # Public base URL for candidate-facing links (opt-out, transparency).
+    public_base_url: str = "http://localhost:8001"
+
     # Email
     resend_api_key: str = ""
     outreach_from_email: str = "recruiting@example.com"
@@ -118,6 +121,7 @@ class Settings(BaseSettings):
     gmail_refresh_token: str = ""
     google_calendar_client_id: str = ""
     google_calendar_client_secret: str = ""
+    google_calendar_refresh_token: str = ""
 
 
 settings = Settings()

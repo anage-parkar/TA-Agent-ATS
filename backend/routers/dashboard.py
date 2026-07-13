@@ -101,6 +101,32 @@ def set_application_stage(application_id: str, stage: str = Body(..., embed=True
     return {"application_id": application_id, "stage": stage}
 
 
+@router.get("/applications/{application_id}/timeline")
+def application_timeline(application_id: str):
+    """Unified candidate timeline: audit events + communications for this application."""
+    detail = repository.get_application_detail(application_id)
+    if not detail:
+        raise HTTPException(status_code=404, detail="Application not found")
+    candidate_id = detail.get("candidate_id") or (detail.get("candidate") or {}).get("id")
+
+    events = repository.list_activity_events("application", application_id)
+    if candidate_id:
+        events += repository.list_activity_events("candidate", candidate_id)
+
+    items = [
+        {"type": "event", "action": e.get("action"), "actor_type": e.get("actor_type"),
+         "actor_id": e.get("actor_id"), "at": e.get("created_at"), "metadata": e.get("metadata")}
+        for e in events
+    ]
+    for m in repository.list_emails_for_application(application_id):
+        items.append({
+            "type": "email", "direction": m.get("direction"), "subject": m.get("subject"),
+            "intent": m.get("intent"), "at": m.get("created_at"),
+        })
+    items.sort(key=lambda x: x.get("at") or "")
+    return {"application_id": application_id, "timeline": items}
+
+
 @router.get("/applications/{application_id}")
 def application_detail(application_id: str):
     """Full detail for one application (candidate + breakdown + enrichment)."""

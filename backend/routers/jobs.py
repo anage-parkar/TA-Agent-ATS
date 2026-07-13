@@ -10,7 +10,7 @@ from fastapi import APIRouter, Body, Depends, HTTPException
 
 from services.rbac import require_permission
 from agents.jd_parser import parse_job
-from agents.scoring import score_candidate
+from agents.scoring import score_candidate_full
 from db import repository
 from services import linkedin_enrich
 from models.candidate import CandidateProfile
@@ -106,6 +106,10 @@ def score_applicants(job_id: str):
     if not job:
         raise HTTPException(status_code=404, detail="Job not found")
     parsed = parsed_from_record(job)
+    # Per-job rubric config (Workstream D) — falls back to defaults in the agent.
+    weights = job.get("weights")
+    threshold = job.get("threshold")
+    requirements = job.get("requirements")
 
     apps = repository.list_applications_for_job(job_id)
     pending = [a for a in apps if a.get("ats_score") is None]
@@ -124,13 +128,14 @@ def score_applicants(job_id: str):
                 profile = CandidateProfile.model_validate(cand)
                 # Enrich from LinkedIn (cached if already done) and factor it in.
                 enrichment = linkedin_enrich.get_or_create_enrichment(cand)
-                breakdown, meta = score_candidate(
-                    parsed, profile, enrichment=enrichment, with_meta=True
+                res = score_candidate_full(
+                    parsed, profile, enrichment=enrichment,
+                    weights=weights, threshold=threshold, requirements=requirements,
                 )
-            return app, profile, breakdown, meta
+            return app, profile, res
         except (LLMError, Exception) as exc:  # noqa: BLE001
             logger.error("Scoring failed for application %s: %s", app.get("id"), exc)
-            return app, None, None, None
+            return app, None, None
 
     with ThreadPoolExecutor(
         max_workers=min(settings.llm_max_concurrency, len(pending))
@@ -138,9 +143,10 @@ def score_applicants(job_id: str):
         scored = list(pool.map(_score, pending))
 
     results = []
-    for app, profile, breakdown, meta in scored:
-        if breakdown is None:
+    for app, profile, res in scored:
+        if res is None:
             continue
+        breakdown = res.breakdown
         repository.update_application(
             app["id"],
             {
@@ -149,37 +155,59 @@ def score_applicants(job_id: str):
                 "status": "scored",
             },
         )
-        # Persist the explainable AI decision (versions + evidence) and emit a
-        # domain event — main thread, so the tenant context is correct.
-        repository.create_ai_decision(
-            {
-                "application_id": app["id"],
-                "candidate_id": app.get("candidate_id"),
-                "job_id": job_id,
-                "kind": "ats_score",
-                "model_version": meta.model_version,
-                "prompt_name": meta.prompt_name,
-                "prompt_version": meta.prompt_version,
-                "prompt_hash": meta.prompt_hash,
-                "input_hash": meta.input_hash,
-                "scores": breakdown.model_dump(),
-                "evidence": {"reasoning": breakdown.reasoning},
-            }
-        )
-        events.emit_event(
-            "candidate.scored",
-            entity_type="application",
-            entity_id=app["id"],
-            actor_type="ai",
-            actor_id="scoring.ats",
-            metadata={"overall_score": breakdown.overall_score},
-        )
+
+        if not res.passed_knockouts:
+            # Deterministic knockout — NOT an AI decision; record an audit event.
+            events.emit_event(
+                "candidate.knocked_out",
+                entity_type="application", entity_id=app["id"],
+                actor_type="system", actor_id="knockouts",
+                metadata={"reasons": res.knockout_reasons},
+            )
+        else:
+            meta = res.llm_result
+            # Explainable AI decision: per-dimension scores + cited evidence + versions.
+            repository.create_ai_decision(
+                {
+                    "application_id": app["id"],
+                    "candidate_id": app.get("candidate_id"),
+                    "job_id": job_id,
+                    "kind": "ats_score",
+                    "model_version": meta.model_version,
+                    "prompt_name": meta.prompt_name,
+                    "prompt_version": meta.prompt_version,
+                    "prompt_hash": meta.prompt_hash,
+                    "input_hash": meta.input_hash,
+                    "scores": {**breakdown.model_dump(), "weights": res.weights,
+                               "threshold": res.threshold},
+                    "evidence": res.evidence,
+                }
+            )
+            events.emit_event(
+                "candidate.scored",
+                entity_type="application", entity_id=app["id"],
+                actor_type="ai", actor_id="scoring.rubric",
+                metadata={"overall_score": breakdown.overall_score,
+                          "below_threshold": res.below_threshold},
+            )
+            if res.quarantined:
+                # Anomalous model output — flag for human review, don't trust it.
+                repository.update_application(app["id"], {"human_review_requested": True})
+                events.emit_event(
+                    "candidate.scoring_quarantined",
+                    entity_type="application", entity_id=app["id"],
+                    actor_type="system", actor_id="output_guard",
+                    metadata={"anomalies": res.anomalies},
+                )
+
         results.append(
             {
                 "application_id": app["id"],
                 "candidate": profile.model_dump(),
                 "ats_score": breakdown.overall_score,
                 "ats_breakdown": breakdown.model_dump(),
+                "passed_knockouts": res.passed_knockouts,
+                "below_threshold": res.below_threshold,
             }
         )
 

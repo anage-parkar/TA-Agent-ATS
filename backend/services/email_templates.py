@@ -24,12 +24,18 @@ def _to_paragraphs(text: str) -> str:
     return "".join(out) or "<p></p>"
 
 
-def render_html(body: str, decision: str = "proceed") -> str:
+def render_html(body: str, decision: str = "proceed", opt_out_url: str | None = None) -> str:
     """Wrap the message body in a branded, responsive HTML email."""
     company = _html.escape(settings.company_name or "Recruiting")
     website = settings.company_website or ""
     paragraphs = _to_paragraphs(body)
     tag = "You're moving forward" if decision == "proceed" else "Application update"
+    opt_out = (
+        f'<br>To stop receiving these emails, <a href="{_html.escape(opt_out_url)}" '
+        f'style="color:#94a3b8;">unsubscribe here</a>.'
+        if opt_out_url
+        else 'If you\'d prefer not to receive these emails, reply with &ldquo;unsubscribe&rdquo;.'
+    )
 
     return f"""<!doctype html>
 <html>
@@ -64,8 +70,8 @@ def render_html(body: str, decision: str = "proceed") -> str:
           <tr>
             <td style="padding:8px 32px 26px;">
               <div style="border-top:1px solid #eef2f6;padding-top:16px;color:#94a3b8;font-size:12px;line-height:1.6;">
-                Sent by the {company} Talent Acquisition team{f' · <a href="{website}" style="color:#94a3b8;">{_html.escape(website)}</a>' if website else ''}.<br>
-                If you'd prefer not to receive these emails, reply with &ldquo;unsubscribe&rdquo;.
+                Sent by the {company} Talent Acquisition team{f' · <a href="{website}" style="color:#94a3b8;">{_html.escape(website)}</a>' if website else ''}.
+                {opt_out}
               </div>
             </td>
           </tr>
@@ -77,7 +83,8 @@ def render_html(body: str, decision: str = "proceed") -> str:
 </html>"""
 
 
-def plain_fallback(body: str) -> str:
+def plain_fallback(body: str, opt_out_url: str | None = None) -> str:
     """Plain-text version (for clients that don't render HTML) + opt-out line."""
     company = settings.company_name or "Recruiting"
-    return f'{body}\n\n—\n{company} Talent Acquisition. Reply "unsubscribe" to opt out.'
+    opt_out = f"To opt out: {opt_out_url}" if opt_out_url else 'Reply "unsubscribe" to opt out.'
+    return f"{body}\n\n—\n{company} Talent Acquisition. {opt_out}"
