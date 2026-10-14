@@ -10,7 +10,7 @@ Privacy).
 
 | Area | Control | Where |
 |---|---|---|
-| Tenant isolation | Postgres Row-Level Security (FORCE) on every domain table, keyed on a per-connection `app.tenant_id`; fail-closed when unbound | `supabase/migrations/0006`, `db/supabase_client.tenant_connection` |
+| Tenant isolation | Postgres Row-Level Security (FORCE) on every domain table, keyed on a per-connection `app.tenant_id`; fail-closed when unbound; proven on every PR against a real Postgres as the non-superuser `app_user` role | `supabase/migrations/0006`, `db/supabase_client.tenant_connection`, `.github/workflows/rls-verify.yml` |
 | Least privilege (DB) | App connects as a non-superuser, non-BYPASSRLS role (`app_user`) | `supabase/migrations/0006` |
 | Access control (app) | RBAC (5 roles) on every mutating route; admin-only tenant/compliance ops | `services/rbac.py`, routers |
 | Authn (model provider) | API-key auth via `LLMGateway`; no shared/consumer credentials in prod | `services/llm/` |
