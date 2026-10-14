@@ -43,3 +43,6 @@ secrets/
 ta-project-*.json
 *serviceaccount*.json
 *.iam.gserviceaccount.com.json
+
+# Internal process brief (keep local; not part of the shipped repo)
+AI-Assisted Recruitment Process.pdf

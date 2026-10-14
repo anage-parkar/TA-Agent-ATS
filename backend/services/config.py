@@ -71,6 +71,10 @@ class Settings(BaseSettings):
     # Redis
     redis_url: str = "redis://localhost:6379"
 
+    # Celery beat schedule (backend/tasks/) — scheduled reply polling + retention.
+    celery_poll_replies_interval_seconds: int = 300   # 5 min
+    celery_retention_hour_utc: int = 3                # run once/day at 03:00 UTC
+
     # Apify
     apify_api_token: str = ""
     use_mock_sourcing: bool = True
