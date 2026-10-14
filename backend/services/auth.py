@@ -15,11 +15,11 @@ from __future__ import annotations
 
 import logging
 
-from fastapi import Request
+from fastapi import HTTPException, Request
 
 from services.config import settings
 from services.rbac import ROLES
-from services.tenant_context import Principal, set_principal
+from services.tenant_context import SYSTEM_USER_PREFIX, Principal, set_principal
 
 logger = logging.getLogger("ta_agent.auth")
 
@@ -36,8 +36,18 @@ def _resolve_principal(request: Request) -> Principal:
         if header_role:
             role = header_role.strip().lower()
 
+    # The automation identity (role SYSTEM_ROLE, user_id "system:<actor>") is
+    # reserved for scheduled jobs bound in-process via tenant_context.use_system().
+    # No HTTP caller may claim it: the role is not in ROLES so it falls to least
+    # privilege below, and the reserved user-id namespace is refused outright
+    # rather than silently re-attributed to someone else.
+    if user.strip().lower().startswith(SYSTEM_USER_PREFIX):
+        logger.warning("request presented a reserved system user id %r", user)
+        raise HTTPException(status_code=401, detail="reserved identity")
+
     if role not in ROLES:
-        # Unknown/spoofed role → least privilege rather than failing the request.
+        # Unknown/spoofed role (including 'system') → least privilege rather
+        # than failing the request.
         logger.warning("unknown role %r; defaulting to interviewer", role)
         role = "interviewer"
 

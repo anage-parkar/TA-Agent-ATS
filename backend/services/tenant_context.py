@@ -35,6 +35,9 @@ class Principal:
 # services.rbac.ROLES, so it can never be obtained over HTTP (auth downgrades
 # unknown roles) and holds no permissions; it exists only to scope a tenant.
 SYSTEM_ROLE = "system"
+# user_id namespace of the automation principal ("system:<actor>"). Reserved:
+# services.auth refuses any HTTP caller that presents an id in this namespace.
+SYSTEM_USER_PREFIX = "system:"
 
 
 _principal: contextvars.ContextVar[Principal | None] = contextvars.ContextVar(
@@ -126,6 +129,6 @@ def use_system(tenant_id: str, *, actor: str = "scheduler"):
     actor_id='system:<actor>' so they are never attributed to a real user.
     """
     with use_principal(
-        Principal(tenant_id=tenant_id, user_id=f"system:{actor}", role=SYSTEM_ROLE)
+        Principal(tenant_id=tenant_id, user_id=f"{SYSTEM_USER_PREFIX}{actor}", role=SYSTEM_ROLE)
     ) as p:
         yield p

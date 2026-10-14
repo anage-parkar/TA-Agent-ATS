@@ -21,12 +21,15 @@ from types import SimpleNamespace
 
 import pytest
 from celery.schedules import crontab
+from fastapi import HTTPException
 from fastapi.testclient import TestClient
+from starlette.requests import Request
 
 from db import repository
 from services import email_service, reply_poller, retention, tenant_context
+from services.auth import _resolve_principal
 from services.config import settings
-from services.rbac import PERMISSIONS, has_permission
+from services.rbac import PERMISSIONS, ROLES, has_permission
 from services.tenant_context import (
     SYSTEM_ROLE,
     get_principal,
@@ -140,10 +143,38 @@ def test_rejection_gate_holds_for_the_scheduler_but_stage_advance_is_allowed():
     assert repository._applications[app["id"]]["status"] != "rejected"
 
 
-def test_system_role_cannot_be_claimed_over_http():
-    # auth downgrades unknown roles to least privilege; 'system' is not an HTTP role.
+def _request(**headers) -> Request:
+    raw = [(k.lower().encode(), v.encode()) for k, v in headers.items()]
+    return Request({"type": "http", "method": "POST", "path": "/", "headers": raw, "query_string": b""})
+
+
+def test_system_role_is_not_an_http_role():
+    # Structural guard: any identity resolver (headers today, token claims
+    # later) that validates against ROLES can never hand out the system role.
+    assert SYSTEM_ROLE not in ROLES
+
+
+@pytest.mark.parametrize("claimed", ["system", "System", " SYSTEM ", "system:scheduler"])
+def test_role_header_cannot_resolve_to_the_system_principal(claimed):
+    p = _resolve_principal(_request(**{"X-User-Role": claimed}))
+    assert p.role in ROLES and p.role != SYSTEM_ROLE
+    assert p.role == "interviewer"  # downgraded to least privilege, request still served
+
+
+def test_system_role_header_gets_least_privilege_over_http():
     r = _client().post("/api/emails/poll-replies", headers={"X-User-Role": "system"})
     assert r.status_code == 403
+
+
+@pytest.mark.parametrize("claimed", ["system:scheduler", "SYSTEM:anything", " system:x"])
+def test_reserved_system_user_id_is_refused(claimed):
+    with pytest.raises(HTTPException) as exc:
+        _resolve_principal(_request(**{"X-User-Id": claimed, "X-User-Role": "admin"}))
+    assert exc.value.status_code == 401
+    # ...and at the HTTP layer, before any route or RBAC check runs.
+    r = _client().post("/api/emails/poll-replies",
+                       headers={"X-User-Id": claimed, "X-User-Role": "admin"})
+    assert r.status_code == 401
 
 
 # ── beat schedule ─────────────────────────────────────────────────────
@@ -348,14 +379,19 @@ def test_retention_task_erases_only_expired_candidates_of_opted_in_tenants():
     assert tenant_context._principal.get() is None
 
 
-def test_operator_run_retention_is_audited_as_human():
+def test_operator_run_retention_is_audited_to_the_admin_who_clicked():
     org = repository.create_organization("A")["id"]
     with use_tenant(org):
         repository.update_organization(org, {"retention_days": 30})
         old = repository.upsert_candidate({"full_name": "Old", "email": "old@a.com"})
         repository._candidates[old["id"]]["created_at"] = _OLD
 
-    r = _client().post(f"/api/admin/tenants/{org}/retention/run")
+    r = _client().post(f"/api/admin/tenants/{org}/retention/run",
+                       headers={"X-User-Id": "admin-jane", "X-User-Role": "admin"})
     assert r.status_code == 200 and r.json()["candidates_erased"] == 1
     erased = [e for e in repository._activity_events.values() if e.get("action") == "candidate.erased"]
-    assert erased and erased[0]["actor_type"] == "human"
+    assert len(erased) == 1
+    assert erased[0]["actor_type"] == "human"
+    assert erased[0]["actor_id"] == "admin-jane"           # the human who clicked, not the default user
+    assert erased[0]["actor_id"] != settings.default_user_id
+    assert erased[0]["tenant_id"] == org                   # written under the target tenant
