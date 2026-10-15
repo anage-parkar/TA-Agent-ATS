@@ -85,6 +85,13 @@ class Settings(BaseSettings):
     celery_poll_replies_interval_seconds: int = 300   # 5 min
     celery_retention_hour_utc: int = 3                # run once/day at 03:00 UTC
 
+    # Phase 2 orchestrator checkpoint storage: "postgres" | "memory". Explicit
+    # configuration, never a fallback on DB availability (see
+    # orchestrator.checkpointer). Unset = memory in a dev-like APP_ENV, postgres
+    # otherwise; memory is refused outside dev; an unreachable postgres fails
+    # startup.
+    checkpointer_backend: str = ""
+
     # Apify
     apify_api_token: str = ""
     use_mock_sourcing: bool = True
