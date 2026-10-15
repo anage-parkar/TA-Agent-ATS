@@ -46,17 +46,18 @@ def assert_safe_auth_config(cfg=None) -> None:
     env = (cfg.app_env or "").strip().lower()
     if not cfg.trust_auth_headers or env in DEV_LIKE_ENVS:
         return
+    shown = repr(env) if env else "<unset: treated as production>"
     if cfg.allow_trusted_headers_outside_dev:
-        security_events.record("auth.trusted_headers_override", severity="critical", app_env=env)
+        security_events.record("auth.trusted_headers_override", severity="critical", app_env=shown)
         logger.critical(
             "TRUST_AUTH_HEADERS=true in APP_ENV=%s with ALLOW_TRUSTED_HEADERS_OUTSIDE_DEV=true: "
             "every caller can claim any tenant/user/role. Acceptable ONLY behind a front door "
             "that strips inbound X-User-* headers and sets them itself.",
-            env,
+            shown,
         )
         return
     raise InsecureAuthConfig(
-        f"Refusing to start: TRUST_AUTH_HEADERS=true in APP_ENV={env!r}. With trusted "
+        f"Refusing to start: TRUST_AUTH_HEADERS=true in APP_ENV={shown}. With trusted "
         "headers, any caller can act as any tenant, user or role. Fix one of: "
         "TRUST_AUTH_HEADERS=false (real auth); APP_ENV=dev|test|ci for local/dev work; "
         "or — ONLY behind a front door that strips inbound X-User-* headers and sets "
