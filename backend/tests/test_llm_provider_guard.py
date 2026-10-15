@@ -1,13 +1,22 @@
 """Worker-side production check: the dev-only CLI LLM provider is refused
-outside a dev-like APP_ENV, and the Celery worker runs that check at start-up."""
+outside a dev-like APP_ENV, and the Celery app module runs that check at
+import — the only wiring that actually aborts a worker (Celery's Signal.send
+swallows handler exceptions, so a worker_init hook would be silently useless)."""
 
 from __future__ import annotations
 
+import ast
+import os
+import pathlib
+import subprocess
+import sys
+
 import pytest
-from celery.signals import worker_init
 
 from services.config import settings
 from services.llm.guard import InsecureLLMConfig, assert_safe_llm_config
+
+BACKEND = pathlib.Path(__file__).resolve().parents[1]
 
 
 def _cfg(monkeypatch, *, provider, env):
@@ -39,16 +48,34 @@ def test_api_provider_is_fine_everywhere(monkeypatch, env):
     assert assert_safe_llm_config() == "api"
 
 
-def test_worker_init_runs_the_guard(monkeypatch):
-    """The handler is connected to Celery's worker_init signal; Celery's `send`
-    propagates handler exceptions, so a raise here aborts worker start-up."""
-    import tasks.celery_app as mod  # registers the receiver
+def test_celery_app_module_calls_the_guard_at_top_level():
+    """Structural: the call must be a module-level statement, not inside a
+    function or signal handler, so merely loading the app refuses to continue."""
+    tree = ast.parse((BACKEND / "tasks" / "celery_app.py").read_text(encoding="utf-8"))
+    top_level_calls = [
+        node.value.func.id
+        for node in tree.body
+        if isinstance(node, ast.Expr) and isinstance(node.value, ast.Call)
+        and isinstance(node.value.func, ast.Name)
+    ]
+    assert "assert_safe_llm_config" in top_level_calls
 
-    _cfg(monkeypatch, provider="cli", env="prod")
-    with pytest.raises(InsecureLLMConfig):
-        mod._refuse_cli_llm_provider_outside_dev()
-    with pytest.raises(InsecureLLMConfig):
-        worker_init.send(sender=None)
 
-    _cfg(monkeypatch, provider="cli", env="dev")
-    worker_init.send(sender=None)  # no raise
+def _import_celery_app(**env_overrides) -> subprocess.CompletedProcess:
+    env = {**os.environ, **env_overrides}
+    return subprocess.run(
+        [sys.executable, "-c", "import tasks.celery_app"],
+        cwd=BACKEND, env=env, capture_output=True, text=True, timeout=120,
+    )
+
+
+def test_loading_the_celery_app_refuses_cli_outside_dev():
+    bad = _import_celery_app(APP_ENV="prod", LLM_PROVIDER="cli")
+    assert bad.returncode != 0
+    assert "InsecureLLMConfig" in bad.stderr
+    assert "LLM_PROVIDER=cli in APP_ENV=prod" in bad.stderr
+
+
+def test_loading_the_celery_app_is_fine_in_dev_and_with_the_api_provider():
+    assert _import_celery_app(APP_ENV="dev", LLM_PROVIDER="cli").returncode == 0
+    assert _import_celery_app(APP_ENV="prod", LLM_PROVIDER="api").returncode == 0

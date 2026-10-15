@@ -29,6 +29,12 @@ logger = logging.getLogger("ta_agent.auth")
 DEV_LIKE_ENVS = frozenset({"dev", "development", "local", "test", "testing", "ci"})
 
 
+def is_dev_like(env: str | None) -> bool:
+    """True for APP_ENV values that permit dev-only conveniences. Unset/blank is
+    NOT dev-like: every guard that uses this fails closed."""
+    return (env or "").strip().lower() in DEV_LIKE_ENVS
+
+
 class InsecureAuthConfig(RuntimeError):
     """The auth configuration would let any caller impersonate any
     tenant/user/role outside a dev-like environment. Raised at startup."""
@@ -44,7 +50,7 @@ def assert_safe_auth_config(cfg=None) -> None:
     """
     cfg = settings if cfg is None else cfg
     env = (cfg.app_env or "").strip().lower()
-    if not cfg.trust_auth_headers or env in DEV_LIKE_ENVS:
+    if not cfg.trust_auth_headers or is_dev_like(env):
         return
     shown = repr(env) if env else "<unset: treated as production>"
     if cfg.allow_trusted_headers_outside_dev:

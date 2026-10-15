@@ -26,9 +26,16 @@ from __future__ import annotations
 
 from celery import Celery
 from celery.schedules import crontab
-from celery.signals import worker_init
 
 from services.config import settings
+from services.llm.guard import assert_safe_llm_config
+
+# Worker-side production check: the Claude Code CLI LLM provider is for local
+# development only. It runs HERE, at import of the app module (which the
+# worker — and beat — load to start), so a misconfigured process never comes
+# up. A Celery signal handler would not do: Signal.send logs and swallows
+# handler exceptions instead of propagating them.
+assert_safe_llm_config()
 
 celery_app = Celery(
     "ta_agent",
@@ -53,16 +60,6 @@ celery_app.conf.update(
         },
     },
 )
-
-@worker_init.connect
-def _refuse_cli_llm_provider_outside_dev(**_kwargs) -> None:
-    """Worker-side production check: the Claude Code CLI LLM provider is for
-    local development only. Celery's `send` propagates handler exceptions, so
-    raising here aborts worker start-up with the guard's message."""
-    from services.llm.guard import assert_safe_llm_config
-
-    assert_safe_llm_config()
-
 
 # Import after celery_app exists so the @celery_app.task decorators in
 # jobs.py register against this instance (tasks/jobs.py imports celery_app
