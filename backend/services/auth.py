@@ -48,7 +48,7 @@ def assert_safe_auth_config(cfg=None) -> None:
         return
     shown = repr(env) if env else "<unset: treated as production>"
     if cfg.allow_trusted_headers_outside_dev:
-        security_events.record("auth.trusted_headers_override", severity="critical", app_env=shown)
+        security_events.record("auth.trusted_headers_override", severity="critical", app_env=env or "<unset>")
         logger.critical(
             "TRUST_AUTH_HEADERS=true in APP_ENV=%s with ALLOW_TRUSTED_HEADERS_OUTSIDE_DEV=true: "
             "every caller can claim any tenant/user/role. Acceptable ONLY behind a front door "
