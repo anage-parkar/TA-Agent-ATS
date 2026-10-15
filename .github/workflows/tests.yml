@@ -1,0 +1,39 @@
+name: Unit tests
+
+# Runs the full backend pytest suite on every PR and every push to main.
+# The suite runs on the in-memory store with the LLM and mailbox faked, so it
+# needs no services or secrets. Tenant RLS is proven separately by the
+# "RLS isolation check" workflow against a real Postgres.
+
+on:
+  pull_request:
+  push:
+    branches: [main]
+
+jobs:
+  pytest:
+    name: Unit tests (pytest)
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+
+    env:
+      APP_ENV: ci
+      # No API key in CI: any LLM call a test forgot to fake fails fast with a
+      # clear LLMError instead of hanging on a CLI that isn't installed.
+      LLM_PROVIDER: api
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.14"
+          cache: pip
+          cache-dependency-path: backend/requirements.txt
+
+      - name: Install dependencies
+        run: python -m pip install --quiet -r backend/requirements.txt
+
+      - name: Run the test suite
+        working-directory: backend
+        run: python -m pytest -q --no-header -p no:cacheprovider --durations=10
