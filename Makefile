@@ -4,7 +4,7 @@
 # LLM access uses the authenticated Claude Code CLI directly (`claude -p`) —
 # there is no proxy to start. Just make sure `claude` is logged in.
 
-.PHONY: help up down dev backend frontend migrate worker logs
+.PHONY: help up down dev backend frontend migrate worker beat logs
 
 help:           ## Show this help
 	@grep -E '^[a-zA-Z_-]+:.*?## .*$$' $(MAKEFILE_LIST) | awk 'BEGIN {FS=":.*?## "}; {printf "  %-12s %s\n", $$1, $$2}'
@@ -27,6 +27,9 @@ frontend:       ## Start frontend only
 
 worker:         ## Start Celery worker
 	cd backend && celery -A tasks.celery_app worker --loglevel=info
+
+beat:           ## Start Celery beat (scheduled reply-poll + retention)
+	cd backend && celery -A tasks.celery_app beat --loglevel=info
 
 migrate:        ## Apply DB migrations to running Postgres
 	docker exec -i ta-agent-db psql -U postgres -d ta_agent < supabase/migrations/0001_init.sql

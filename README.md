@@ -18,12 +18,16 @@ robustly recover the JSON object (tolerating fences, trailing prose, and
 trailing commas). Independent calls (e.g. scoring N candidates) run in a small
 thread pool. Model is a CLI alias (`sonnet` / `opus` / `haiku`) via `LLM_MODEL`.
 
-> **Current status:** the **first vertical slice is built and verified** —
-> paste a LinkedIn URL → JD parser agent → store → source mock candidates →
-> ATS scoring agent → ranked candidate cards with score badges and a
-
-Proceed/Reject human-in-the-loop gate. Email, calendar, Celery, and the
-LangGraph orchestrator are scaffolded next (see [Build order](#build-order)).
+> **Current status:** far past the first vertical slice — job ingestion,
+> ATS scoring, outreach (email draft/send with GDPR opt-out), reply
+> classification, interview scheduling (free/busy + calendar invite), and
+> scheduled background reply-polling/retention (Celery worker + beat) are all
+> built, human-gated, and tested, alongside multi-tenancy/RBAC,
+> prompt-injection defense, and compliance/bias infrastructure (audit log,
+> adverse-impact reporting, GDPR export/erasure). What's still open: the
+> LangGraph orchestrator (installed but unused — the pipeline is currently
+> driven by discrete, human-triggered API calls) and an in-app Settings UI.
+> See [Build order](#build-order) for the full picture.
 
 
 ## 1. Prerequisites
@@ -186,9 +190,14 @@ Docker isn't running or the DB container isn't up. `./tasks.ps1 up`, then check
 Backend must be on `:8001`; the API base URL is `NEXT_PUBLIC_API_BASE_URL` in
 `frontend/.env.local`. CORS allows `localhost:3001` and `localhost:3000`.
 
-**Celery worker not picking up tasks**
-Ensure Redis is up (`docker ps`) and start the worker:
-`./tasks.ps1 worker` (uses `--pool=solo` on Windows).
+**Celery worker not picking up tasks / scheduled reply-poll & retention not running**
+Ensure Redis is up (`docker ps`), then start **both** processes — the worker
+executes tasks, but only `beat` puts them on the schedule:
+`./tasks.ps1 worker` (uses `--pool=solo` on Windows) and, in a separate
+window, `./tasks.ps1 beat`. Without `beat` running, `poll-email-replies` and
+`enforce-retention` (`backend/tasks/celery_app.py`) never fire on their own —
+you'd only see replies picked up via the on-demand
+`POST /api/emails/poll-replies` call.
 
 
 ## Project structure
@@ -246,24 +255,31 @@ See `mcp-servers/linkedin/README.md` for the LinkedIn side.
 ## Build order
 
 1. ✅ Docker Compose + Makefile/tasks.ps1
-2. ✅ LLM via Claude Code CLI (`claude -p`; live call verified — `call_claude` returns `PONG`)
+2. ✅ LLM gateway — provider-swappable (`cli`: Claude Code CLI for local dev; `api`: Anthropic API key for production), prompt registry, rate limiting, usage tracking (`backend/services/llm/gateway.py`)
 3. ✅ DB migrations (schema + pgvector) — applied to cloud Supabase (ap-south-1)
-
-4. ✅ FastAPI skeleton (`main.py`, `llm_client.py`, health check)
+4. ✅ FastAPI skeleton (`main.py`, health check)
 5. ✅ Job ingestion (paste-URL JD parser + LinkedIn MCP job sync)
-6. ✅ ATS scoring + applications table (outbound source + inbound applicants)
-
-7. ✅ Recruiter review UI (candidate list, Proceed/Reject)
+6. ✅ ATS scoring + applications table — redacted profiles, deterministic knockouts run outside the LLM, per-job configurable weights, evidence-backed
+7. ✅ Recruiter review UI (candidate list, Proceed/Reject) — human-in-the-loop gate enforced at the DB layer; no unattended reject
 7b. ✅ LinkedIn MCP: job + applicant sync (Apply Connect), mock mode + score-applicants endpoint
-8. ⬜ Email draft + send (outreach agent + Resend + EmailDraftModal)
+8. ✅ Email draft + send (outreach agent + Resend/Gmail + `EmailDraftModal`) — human-approved send, GDPR opt-out link on every message
+9. ✅ Email tracking — `backend/tasks/celery_app.py` + `tasks/jobs.py` schedule `poll_replies_all_tenants` (every 5 min) and `enforce_retention_all_tenants` (daily) across every tenant; run with `tasks.ps1 worker` + `tasks.ps1 beat`
+10. ✅ Response parser (intent classification — `agents/response_parser.classify_reply`)
+11. ✅ Interview scheduler (free/busy slot proposals + human-confirmed booking, `routers/interviews.py`)
+12. ✅ Interview invite agent (+ Calendar event, logged to candidate timeline)
+13. ⬜ LangGraph orchestrator — `langgraph` is an installed dependency but unused; the pipeline is driven by discrete, human-triggered API calls rather than a stateful graph
+14. ✅ Pipeline Kanban UI (per-channel boards: Sourced → Reviewed → Outreach → Replied → Interview → Offer)
 
-9. ⬜ Email tracking (Celery + Gmail polling)
-10. ⬜ Response parser (intent classification)
-11. ⬜ Interview scheduler UI (+ Calendar free/busy)
+Beyond this original list, seven more workstreams have since shipped (see
+`git log`: `9b04e07`…`425ee64`):
 
-12. ⬜ Interview invite agent (+ Calendar event)
-13. ⬜ LangGraph orchestrator (full state machine, Redis checkpoints)
-14. ⬜ Pipeline Kanban UI
+- Workstream 0/A — API-key LLM gateway + multi-tenancy (RLS/RBAC)
+- Workstream B — candidate-as-a-person data model, audit log, explainable `ai_decisions`
+- Workstream C — human-in-the-loop rejection gate (no solely-automated reject)
+- Workstream D — redacted, configurable, evidence-backed scoring
+- Workstream E — untrusted-input & prompt-injection defense
+- Workstream F — compliance & bias infrastructure (adverse-impact reports, GDPR export/erasure, retention)
+- Workstream G — engagement & scheduling hardening (opt-out enforcement, reply intent, human-gated interview confirm)
 
 ## Engineering rules (enforced)
 
@@ -276,7 +292,7 @@ Every LLM JSON output is validated by a Pydantic model before use.
 
 Human-in-the-loop gates are never bypassed — no email is sent without
 recruiter approval.
-Outreach emails will include a GDPR opt-out link (build step 8).
+Outreach emails include a GDPR opt-out link on every send.
 
 # TA-Agent-ATS
 Full-stack AI application that automates the end-to-end hiring workflow: ingest a LinkedIn job post, source and score candidates, review them with a human in the loop, draft and send outreach, parse replies, and schedule interviews
@@ -305,11 +321,16 @@ TA App agents (Python) → subprocess: claude -p "<prompt>" --output-format json
 > trailing commas). Independent calls (e.g. scoring N candidates) run in a small
 > thread pool. Model is a CLI alias (`sonnet` / `opus` / `haiku`) via `LLM_MODEL`.
 
-> **Current status:** the **first vertical slice is built and verified** —
-> paste a LinkedIn URL → JD parser agent → store → source mock candidates →
-> ATS scoring agent → ranked candidate cards with score badges and a
-> Proceed/Reject human-in-the-loop gate. Email, calendar, Celery, and the
-> LangGraph orchestrator are scaffolded next (see [Build order](#build-order)).
+> **Current status:** far past the first vertical slice — job ingestion,
+> ATS scoring, outreach (email draft/send with GDPR opt-out), reply
+> classification, interview scheduling (free/busy + calendar invite), and
+> scheduled background reply-polling/retention (Celery worker + beat) are all
+> built, human-gated, and tested, alongside multi-tenancy/RBAC,
+> prompt-injection defense, and compliance/bias infrastructure (audit log,
+> adverse-impact reporting, GDPR export/erasure). What's still open: the
+> LangGraph orchestrator (installed but unused — the pipeline is currently
+> driven by discrete, human-triggered API calls) and an in-app Settings UI.
+> See [Build order](#build-order) for the full picture.
 
 ---
 
@@ -472,9 +493,14 @@ Docker isn't running or the DB container isn't up. `./tasks.ps1 up`, then check
 Backend must be on `:8001`; the API base URL is `NEXT_PUBLIC_API_BASE_URL` in
 `frontend/.env.local`. CORS allows `localhost:3001` and `localhost:3000`.
 
-**Celery worker not picking up tasks**
-Ensure Redis is up (`docker ps`) and start the worker:
-`./tasks.ps1 worker` (uses `--pool=solo` on Windows).
+**Celery worker not picking up tasks / scheduled reply-poll & retention not running**
+Ensure Redis is up (`docker ps`), then start **both** processes — the worker
+executes tasks, but only `beat` puts them on the schedule:
+`./tasks.ps1 worker` (uses `--pool=solo` on Windows) and, in a separate
+window, `./tasks.ps1 beat`. Without `beat` running, `poll-email-replies` and
+`enforce-retention` (`backend/tasks/celery_app.py`) never fire on their own —
+you'd only see replies picked up via the on-demand
+`POST /api/emails/poll-replies` call.
 
 ---
 
@@ -526,20 +552,31 @@ See `mcp-servers/linkedin/README.md` for the LinkedIn side.
 ## Build order
 
 1. ✅ Docker Compose + Makefile/tasks.ps1
-2. ✅ LLM via Claude Code CLI (`claude -p`; live call verified — `call_claude` returns `PONG`)
+2. ✅ LLM gateway — provider-swappable (`cli`: Claude Code CLI for local dev; `api`: Anthropic API key for production), prompt registry, rate limiting, usage tracking (`backend/services/llm/gateway.py`)
 3. ✅ DB migrations (schema + pgvector) — applied to cloud Supabase (ap-south-1)
-4. ✅ FastAPI skeleton (`main.py`, `llm_client.py`, health check)
+4. ✅ FastAPI skeleton (`main.py`, health check)
 5. ✅ Job ingestion (paste-URL JD parser + LinkedIn MCP job sync)
-6. ✅ ATS scoring + applications table (outbound source + inbound applicants)
-7. ✅ Recruiter review UI (candidate list, Proceed/Reject)
+6. ✅ ATS scoring + applications table — redacted profiles, deterministic knockouts run outside the LLM, per-job configurable weights, evidence-backed
+7. ✅ Recruiter review UI (candidate list, Proceed/Reject) — human-in-the-loop gate enforced at the DB layer; no unattended reject
 7b. ✅ LinkedIn MCP: job + applicant sync (Apply Connect), mock mode + score-applicants endpoint
-8. ⬜ Email draft + send (outreach agent + Resend + EmailDraftModal)
-9. ⬜ Email tracking (Celery + Gmail polling)
-10. ⬜ Response parser (intent classification)
-11. ⬜ Interview scheduler UI (+ Calendar free/busy)
-12. ⬜ Interview invite agent (+ Calendar event)
-13. ⬜ LangGraph orchestrator (full state machine, Redis checkpoints)
-14. ⬜ Pipeline Kanban UI
+8. ✅ Email draft + send (outreach agent + Resend/Gmail + `EmailDraftModal`) — human-approved send, GDPR opt-out link on every message
+9. ✅ Email tracking — `backend/tasks/celery_app.py` + `tasks/jobs.py` schedule `poll_replies_all_tenants` (every 5 min) and `enforce_retention_all_tenants` (daily) across every tenant; run with `tasks.ps1 worker` + `tasks.ps1 beat`
+10. ✅ Response parser (intent classification — `agents/response_parser.classify_reply`)
+11. ✅ Interview scheduler (free/busy slot proposals + human-confirmed booking, `routers/interviews.py`)
+12. ✅ Interview invite agent (+ Calendar event, logged to candidate timeline)
+13. ⬜ LangGraph orchestrator — `langgraph` is an installed dependency but unused; the pipeline is driven by discrete, human-triggered API calls rather than a stateful graph
+14. ✅ Pipeline Kanban UI (per-channel boards: Sourced → Reviewed → Outreach → Replied → Interview → Offer)
+
+Beyond this original list, seven more workstreams have since shipped (see
+`git log`: `9b04e07`…`425ee64`):
+
+- Workstream 0/A — API-key LLM gateway + multi-tenancy (RLS/RBAC)
+- Workstream B — candidate-as-a-person data model, audit log, explainable `ai_decisions`
+- Workstream C — human-in-the-loop rejection gate (no solely-automated reject)
+- Workstream D — redacted, configurable, evidence-backed scoring
+- Workstream E — untrusted-input & prompt-injection defense
+- Workstream F — compliance & bias infrastructure (adverse-impact reports, GDPR export/erasure, retention)
+- Workstream G — engagement & scheduling hardening (opt-out enforcement, reply intent, human-gated interview confirm)
 
 ## Engineering rules (enforced)
 
@@ -550,7 +587,7 @@ See `mcp-servers/linkedin/README.md` for the LinkedIn side.
 - Every LLM JSON output is validated by a Pydantic model before use.
 - Human-in-the-loop gates are never bypassed — no email is sent without
   recruiter approval.
-- Outreach emails will include a GDPR opt-out link (build step 8).
+- Outreach emails include a GDPR opt-out link on every send.
 - LinkedIn scraping throttles to ≥3s between requests.
 - ATS score breakdowns are always stored and shown — no black-box scores.
 ```

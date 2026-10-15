@@ -10,7 +10,7 @@ Privacy).
 
 | Area | Control | Where |
 |---|---|---|
-| Tenant isolation | Postgres Row-Level Security (FORCE) on every domain table, keyed on a per-connection `app.tenant_id`; fail-closed when unbound | `supabase/migrations/0006`, `db/supabase_client.tenant_connection` |
+| Tenant isolation | Postgres Row-Level Security (FORCE) on every domain table, keyed on a per-connection `app.tenant_id`; fail-closed when unbound; proven on every PR against a real Postgres as the non-superuser `app_user` role | `supabase/migrations/0006`, `db/supabase_client.tenant_connection`, `.github/workflows/rls-verify.yml` |
 | Least privilege (DB) | App connects as a non-superuser, non-BYPASSRLS role (`app_user`) | `supabase/migrations/0006` |
 | Access control (app) | RBAC (5 roles) on every mutating route; admin-only tenant/compliance ops | `services/rbac.py`, routers |
 | Authn (model provider) | API-key auth via `LLMGateway`; no shared/consumer credentials in prod | `services/llm/` |
@@ -19,6 +19,7 @@ Privacy).
 | Input integrity | Untrusted-input sanitization, prompt-injection defense, output guarding, attachment validation | `services/sanitize.py`, `services/attachments.py` |
 | Data minimization | Scoring runs on a redacted profile; EEO data segregated and never scored | `services/redaction.py`, `eeo_records` |
 | Data lifecycle | Per-candidate export + erasure; per-tenant export + purge; configurable retention with automated deletion | `db/repository`, `services/retention.py` |
+| Background-job least privilege | Scheduled jobs (reply polling, retention) bind each tenant under a non-human `system` principal: no RBAC permissions, cannot satisfy the human-actor gate, audited as `actor_type=system`; the role cannot be obtained over HTTP | `services/tenant_context.use_system`, `backend/tasks/jobs.py` |
 | Encryption in transit | TLS to the API, DB (Supabase pooler), and all sub-processors | infra |
 | Encryption at rest | Managed-Postgres at-rest encryption; uploads on encrypted volumes | infra (provider-managed) |
 
@@ -31,5 +32,4 @@ Privacy).
   procedures (process, not code).
 - Backups + restore testing; availability/DR runbook.
 - Real malware scanning wired into the attachment `set_scanner()` seam.
-- Background-job auth hardening (cron/worker must run as a non-admin principal).
 - Penetration test + continuous vulnerability scanning.

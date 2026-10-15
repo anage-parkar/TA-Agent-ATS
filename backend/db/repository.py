@@ -126,14 +126,20 @@ def _emit_audit(
     *,
     before: dict | None = None,
     after: dict | None = None,
-    actor_type: str = "human",
+    actor_type: str | None = None,
     actor_id: str | None = None,
     metadata: dict | None = None,
 ) -> None:
     """Write one append-only activity_events row for a state change.
 
+    actor_type defaults from the bound principal: 'human' when a person is
+    driving the call, 'system' for unattended automation (use_system / no
+    principal). Callers pass it explicitly for 'ai' / 'candidate' actors.
+
     Best-effort: an audit write must never break the underlying operation.
     """
+    if actor_type is None:
+        actor_type = "human" if is_human_principal() else "system"
     try:
         create_activity_event(
             {
@@ -1146,6 +1152,16 @@ def get_organization(tenant_id: str | None = None) -> Optional[dict]:
     with tenant_connection() as conn:
         cur = conn.execute("select * from organizations where id = %s", (tid,))
         return _row(cur)
+
+
+def list_organizations() -> list[dict]:
+    """All tenants (control-plane; no RLS on this table — used by scheduled
+    cross-tenant jobs, e.g. retention/reply-polling, which run outside a
+    request and so have no single tenant already bound)."""
+    if not db_available():
+        return list(_orgs.values()) or [get_organization()]
+    with tenant_connection() as conn:
+        return _rows(conn.execute("select * from organizations order by created_at"))
 
 
 def update_organization(tenant_id: str, fields: dict[str, Any]) -> Optional[dict]:

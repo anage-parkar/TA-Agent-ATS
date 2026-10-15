@@ -16,9 +16,8 @@ from fastapi import APIRouter, Body, Depends, HTTPException
 
 from services.rbac import require_permission
 from agents.outreach import draft_decision_email, template_decision_email
-from agents.response_parser import classify_reply
 from db import repository
-from services import email_service, events
+from services import email_service, events, reply_poller
 from services.config import settings
 from services.llm_client import LLMError
 from services.tenant_context import current_user_id
@@ -141,46 +140,13 @@ def send_email(
 
 @router.post("/emails/poll-replies", dependencies=[Depends(require_permission("email.send"))])
 def poll_replies():
-    """Pull replies, classify intent, auto-advance interested ones to 'Replied'."""
-    ok, reason = email_service.availability()
-    if not ok:
-        return {"ok": False, "detail": reason}
+    """Pull replies, classify intent, auto-advance interested ones to 'Replied'.
 
-    threads = repository.list_outbound_threads()
-    by_thread = {t["thread_id"]: t["application_id"] for t in threads if t.get("thread_id")}
+    On-demand entry point for the current tenant; the same logic also runs on
+    a schedule for every tenant via tasks.jobs.poll_replies_all_tenants.
+    """
     try:
-        replies = email_service.list_replies(set(by_thread.keys()))
+        return reply_poller.poll_replies()
     except Exception as exc:  # noqa: BLE001
         logger.exception("Reply poll failed")
         raise HTTPException(status_code=502, detail=f"Reply poll failed: {exc}") from exc
-
-    advanced, recorded = 0, 0
-    for r in replies:
-        tid = r["thread_id"]
-        if repository.reply_already_recorded(tid):
-            continue
-        app_id = by_thread.get(tid)
-        if not app_id:
-            continue
-        try:
-            intent = classify_reply(r["body"])
-        except LLMError:
-            continue
-        repository.create_email(
-            {
-                "application_id": app_id,
-                "direction": "inbound",
-                "subject": "(reply)",
-                "body": r["body"],
-                "replied_at": _now(),
-                "intent": intent.intent,
-                "raw_reply": r["body"],
-                "thread_id": tid,
-            }
-        )
-        recorded += 1
-        if intent.intent == "interested":
-            repository.update_application(app_id, {"stage": "Replied"})
-            advanced += 1
-
-    return {"ok": True, "replies": recorded, "advanced_to_replied": advanced}

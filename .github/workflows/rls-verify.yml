@@ -1,0 +1,59 @@
+name: RLS isolation check
+
+# Proves Postgres Row-Level Security tenant isolation on every PR, against a
+# real Postgres, as the NON-superuser `app_user` role the application must run
+# as in production. The unit-test suite runs on the in-memory store and cannot
+# exercise RLS, so this is the only automated proof of the isolation boundary.
+
+on:
+  pull_request:
+  push:
+    branches: [main]
+
+jobs:
+  rls:
+    name: Verify tenant RLS as app_user
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+
+    services:
+      postgres:
+        # pgvector image: migration 0001 needs the `vector` extension.
+        image: pgvector/pgvector:pg16
+        env:
+          POSTGRES_PASSWORD: localpassword
+          POSTGRES_DB: ta_agent
+        ports:
+          - 5433:5432
+        options: >-
+          --health-cmd "pg_isready -U postgres -d ta_agent"
+          --health-interval 5s
+          --health-timeout 5s
+          --health-retries 12
+
+    env:
+      RLS_TEST_DATABASE_URL: postgresql://postgres:localpassword@localhost:5433/ta_agent
+      RLS_TEST_ROLE: rls_tester
+      RLS_TEST_ROLE_PASSWORD: testpw
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Install the DB driver
+        run: python -m pip install --quiet "psycopg[binary]>=3.2"
+
+      - name: Create the non-superuser login role
+        # A plain login with NO direct table grants. The verifier makes it a
+        # member of `app_user` (created by migration 0006) and SET ROLEs to it,
+        # so every privilege under test comes from the migration itself.
+        run: |
+          command -v psql >/dev/null || sudo apt-get install -y -q postgresql-client
+          psql "$RLS_TEST_DATABASE_URL" -v ON_ERROR_STOP=1 -c \
+            "create role ${RLS_TEST_ROLE} login password '${RLS_TEST_ROLE_PASSWORD}' nosuperuser nobypassrls;"
+
+      - name: Apply migrations and verify RLS as app_user
+        run: python backend/scripts/verify_rls.py

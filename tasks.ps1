@@ -36,6 +36,10 @@ switch ($Task) {
         Set-Location "$root/backend"
         celery -A tasks.celery_app worker --loglevel=info --pool=solo
     }
+    "beat" {
+        Set-Location "$root/backend"
+        celery -A tasks.celery_app beat --loglevel=info
+    }
     "migrate" {
         Get-Content "$root/supabase/migrations/0001_init.sql" |
             docker exec -i ta-agent-db psql -U postgres -d ta_agent
@@ -49,6 +53,7 @@ switch ($Task) {
         Write-Host "  backend   Start backend only (port 8001)"
         Write-Host "  frontend  Start frontend only (port 3001)"
         Write-Host "  worker    Start Celery worker"
+        Write-Host "  beat      Start Celery beat (scheduled reply-poll + retention)"
         Write-Host "  migrate   Apply DB migrations"
         Write-Host "  logs      Tail docker logs"
     }

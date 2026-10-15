@@ -15,7 +15,7 @@ from fastapi import APIRouter, Body, Depends, HTTPException
 from db import repository
 from services import bias, retention
 from services.rbac import require_permission
-from services.tenant_context import use_tenant
+from services.tenant_context import current_role, current_user_id, use_tenant
 
 logger = logging.getLogger("ta_agent.routers.admin")
 
@@ -71,7 +71,9 @@ def adverse_impact(tenant_id: str, min_group: int = 5):
 @router.post("/tenants/{tenant_id}/retention/run")
 def run_retention(tenant_id: str):
     """Enforce the tenant's retention policy now (also run on a schedule)."""
-    with use_tenant(tenant_id):
+    # Bind the target tenant *as the admin making the request*, so the erasure
+    # audit rows name them — not the seeded default user.
+    with use_tenant(tenant_id, user_id=current_user_id(), role=current_role()):
         return retention.enforce(tenant_id)
 
 
