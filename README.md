@@ -202,7 +202,8 @@ you'd only see replies picked up via the on-demand
 **Backend refuses to start: "TRUST_AUTH_HEADERS=true in APP_ENV=..."**
 Trusting `X-User-*` headers is a dev convenience (any caller can be any
 tenant/user/role), so outside a dev-like `APP_ENV` (`dev`, `test`, `ci`,
-`local`) the backend refuses to boot with it on. Fix: `TRUST_AUTH_HEADERS=false`
+`local`) the backend refuses to boot with it on — and an unset `APP_ENV`
+counts as production. Fix: `TRUST_AUTH_HEADERS=false`
 (real auth), or `APP_ENV=dev` for local work. `ALLOW_TRUSTED_HEADERS_OUTSIDE_DEV=true`
 overrides it only behind a front door that strips inbound `X-User-*` headers
 and sets them itself. Attempts to claim the reserved `system` role or
@@ -515,7 +516,8 @@ you'd only see replies picked up via the on-demand
 **Backend refuses to start: "TRUST_AUTH_HEADERS=true in APP_ENV=..."**
 Trusting `X-User-*` headers is a dev convenience (any caller can be any
 tenant/user/role), so outside a dev-like `APP_ENV` (`dev`, `test`, `ci`,
-`local`) the backend refuses to boot with it on. Fix: `TRUST_AUTH_HEADERS=false`
+`local`) the backend refuses to boot with it on — and an unset `APP_ENV`
+counts as production. Fix: `TRUST_AUTH_HEADERS=false`
 (real auth), or `APP_ENV=dev` for local work. `ALLOW_TRUSTED_HEADERS_OUTSIDE_DEV=true`
 overrides it only behind a front door that strips inbound `X-User-*` headers
 and sets them itself. Attempts to claim the reserved `system` role or

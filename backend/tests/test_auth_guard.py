@@ -68,6 +68,27 @@ def test_trusted_headers_refused_outside_dev(monkeypatch, env, events):
     assert events == []
 
 
+def test_unset_app_env_is_treated_as_production(monkeypatch):
+    """The out-of-the-box default (no APP_ENV anywhere) must fail closed —
+    an operator who forgot to set it gets a refusal, not a silently dev app."""
+    from services.config import Settings
+
+    monkeypatch.delenv("APP_ENV", raising=False)
+    fresh = Settings(_env_file=None)  # ignore local .env files: pure defaults
+    assert fresh.app_env == ""
+    assert fresh.trust_auth_headers is True  # the dangerous combination, by default
+    with pytest.raises(InsecureAuthConfig) as exc:
+        assert_safe_auth_config(fresh)
+    assert "unset" in str(exc.value).lower()
+
+
+@pytest.mark.parametrize("value", ["", "   ", None])
+def test_blank_app_env_fails_closed(monkeypatch, value):
+    _cfg(monkeypatch, app_env=value)
+    with pytest.raises(InsecureAuthConfig):
+        assert_safe_auth_config()
+
+
 def test_prod_with_real_auth_is_fine(monkeypatch):
     _cfg(monkeypatch, app_env="prod", trust=False)
     assert_safe_auth_config()

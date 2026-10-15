@@ -63,8 +63,9 @@ class Settings(BaseSettings):
     trust_auth_headers: bool = True
     # Deployment environment: dev | test | ci | staging | prod. Dev-like values
     # (services.auth.DEV_LIKE_ENVS) permit dev-only conveniences such as trusted
-    # headers; anything else is treated as production.
-    app_env: str = "dev"
+    # headers; anything else — INCLUDING UNSET — is treated as production, so
+    # the startup guard fails closed. Local dev must set APP_ENV=dev explicitly.
+    app_env: str = ""
     # Trusting X-User-* headers outside dev/test lets ANY caller be any
     # tenant/user/role, so the app refuses to start in that configuration
     # unless this is explicitly set — and only behind a front door that strips
