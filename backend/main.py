@@ -19,7 +19,7 @@ from fastapi.staticfiles import StaticFiles
 from db.repository import HumanActorRequired
 from db.supabase_client import close_pool, db_available
 from routers import admin, applications, candidates, dashboard, emails, interviews, jobs, jd_generation, legal, sourcing, website
-from services.auth import bind_request_context
+from services.auth import assert_safe_auth_config, bind_request_context
 from services.llm import get_gateway
 
 logging.basicConfig(level=logging.INFO, format="%(levelname)s %(name)s: %(message)s")
@@ -47,6 +47,9 @@ def _verify_llm() -> bool:
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
+    # Refuse to boot with an auth configuration that would let any caller
+    # impersonate any tenant/user/role outside dev (services.auth).
+    assert_safe_auth_config()
     app.state.llm_ok = _verify_llm()
     app.state.db_ok = db_available()
     if not app.state.db_ok:

@@ -199,6 +199,16 @@ window, `./tasks.ps1 beat`. Without `beat` running, `poll-email-replies` and
 you'd only see replies picked up via the on-demand
 `POST /api/emails/poll-replies` call.
 
+**Backend refuses to start: "TRUST_AUTH_HEADERS=true in APP_ENV=..."**
+Trusting `X-User-*` headers is a dev convenience (any caller can be any
+tenant/user/role), so outside a dev-like `APP_ENV` (`dev`, `test`, `ci`,
+`local`) the backend refuses to boot with it on. Fix: `TRUST_AUTH_HEADERS=false`
+(real auth), or `APP_ENV=dev` for local work. `ALLOW_TRUSTED_HEADERS_OUTSIDE_DEV=true`
+overrides it only behind a front door that strips inbound `X-User-*` headers
+and sets them itself. Attempts to claim the reserved `system` role or
+`system:` identity are logged as `security_event` lines on the
+`ta_agent.security` logger (`services/security_events.py` has a sink seam).
+
 
 ## Project structure
 
@@ -501,6 +511,16 @@ window, `./tasks.ps1 beat`. Without `beat` running, `poll-email-replies` and
 `enforce-retention` (`backend/tasks/celery_app.py`) never fire on their own —
 you'd only see replies picked up via the on-demand
 `POST /api/emails/poll-replies` call.
+
+**Backend refuses to start: "TRUST_AUTH_HEADERS=true in APP_ENV=..."**
+Trusting `X-User-*` headers is a dev convenience (any caller can be any
+tenant/user/role), so outside a dev-like `APP_ENV` (`dev`, `test`, `ci`,
+`local`) the backend refuses to boot with it on. Fix: `TRUST_AUTH_HEADERS=false`
+(real auth), or `APP_ENV=dev` for local work. `ALLOW_TRUSTED_HEADERS_OUTSIDE_DEV=true`
+overrides it only behind a front door that strips inbound `X-User-*` headers
+and sets them itself. Attempts to claim the reserved `system` role or
+`system:` identity are logged as `security_event` lines on the
+`ta_agent.security` logger (`services/security_events.py` has a sink seam).
 
 ---
 

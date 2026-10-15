@@ -61,6 +61,15 @@ class Settings(BaseSettings):
     # principal. TRUE only because a trusted front door / dev is the caller; set
     # FALSE once real authenticated sessions land (Workstream A auth roadmap).
     trust_auth_headers: bool = True
+    # Deployment environment: dev | test | ci | staging | prod. Dev-like values
+    # (services.auth.DEV_LIKE_ENVS) permit dev-only conveniences such as trusted
+    # headers; anything else is treated as production.
+    app_env: str = "dev"
+    # Trusting X-User-* headers outside dev/test lets ANY caller be any
+    # tenant/user/role, so the app refuses to start in that configuration
+    # unless this is explicitly set — and only behind a front door that strips
+    # inbound X-User-* headers and sets them itself. Prefer real auth.
+    allow_trusted_headers_outside_dev: bool = False
 
     # Database
     database_url: str = "postgresql://postgres:localpassword@localhost:5432/ta_agent"
