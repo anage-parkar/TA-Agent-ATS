@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import json
 import logging
+import uuid
 from concurrent.futures import ThreadPoolExecutor
 
 from fastapi import APIRouter, Depends, HTTPException
@@ -153,6 +154,25 @@ def recruiter_decision(application_id: str, decision: RecruiterDecision):
     """Human-in-the-loop gate: proceed or reject a candidate."""
     if decision.decision not in ("proceed", "reject"):
         raise HTTPException(status_code=400, detail="decision must be 'proceed' or 'reject'")
+
+    current = repository.get_application(application_id)
+    if current is None:
+        raise HTTPException(status_code=404, detail="Application not found")
+    if current.get("orchestrated"):
+        # Orchestrated application (Phase 2): the decision is a resume of its
+        # graph thread. The repository's human-actor gate still applies inside.
+        from orchestrator import runner
+
+        try:
+            thread = runner.resume_thread(
+                application_id,
+                {"decision": decision.decision, "event_id": f"evt:{uuid.uuid4().hex}"},
+            )
+        except runner.OrchestratorError as exc:
+            raise HTTPException(status_code=409, detail=str(exc)) from exc
+        refreshed = repository.get_application(application_id) or current
+        return {"application_id": application_id, "status": refreshed.get("status"),
+                "stage": refreshed.get("stage"), "thread": thread}
 
     status = "approved" if decision.decision == "proceed" else "rejected"
     fields = {"status": status, "recruiter_decision": decision.decision}
