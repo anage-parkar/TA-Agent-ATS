@@ -171,7 +171,8 @@ def create_job(data: dict[str, Any]) -> dict:
     data = {k: data.get(k) for k in _JOB_FIELDS}
 
     if not db_available():
-        job = {"id": _new_id(), "created_at": _now(), "parsed_at": _now(), **data}
+        job = {"id": _new_id(), "created_at": _now(), "parsed_at": _now(),
+               "orchestrator_mode": "off", **data}
         return _put(_jobs, job)
 
     with tenant_connection() as conn:
@@ -411,6 +412,8 @@ def create_application(data: dict[str, Any]) -> dict:
             "ats_breakdown": data.get("ats_breakdown"),
             "stage": data.get("stage", "Sourced"),
             "recruiter_decision": None,
+            "orchestrated": False,      # rollout snapshot, frozen at thread start (Phase 2)
+            "graph_version": None,
             "created_at": _now(),
             "updated_at": _now(),
             **data,
@@ -597,6 +600,14 @@ def count_applications_by_source() -> dict[str, int]:
     with tenant_connection() as conn:
         cur = conn.execute("select source, count(*) from applications group by source")
         return {row[0]: row[1] for row in cur.fetchall()}
+
+
+def get_application(application_id: str) -> Optional[dict]:
+    """The bare application row (tenant-scoped)."""
+    if not db_available():
+        return _get(_applications, application_id)
+    with tenant_connection() as conn:
+        return _row(conn.execute("select * from applications where id = %s", (application_id,)))
 
 
 def get_application_detail(application_id: str) -> Optional[dict]:

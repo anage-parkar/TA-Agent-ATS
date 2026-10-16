@@ -89,6 +89,15 @@ def test_t1_system_resume_cannot_reject_a_human_started_thread():
     refused = _events("orchestrator.reject_refused", app["id"])
     assert refused and refused[0]["actor_type"] == "system" and refused[0]["actor_id"] == "system:orchestrator"
 
+    # The planted "reject" must not survive the refusal: LangGraph persists a
+    # resume value before the node runs, so the runner discards it on failure.
+    # A human who now proceeds must get PROCEED, not the system's reject.
+    with use_tenant(A, user_id=RECRUITER_2):
+        status = runner.resume_thread(app["id"], {"decision": "proceed", "event_id": "evt:1b"})
+    assert status["waiting_on"] == "send_gate"
+    assert _app(app["id"])["status"] == "approved"
+    assert status["decisions"][-1]["outcome"] == "proceed" and status["decisions"][-1]["by"] == RECRUITER_2
+
 
 # ── T2: a different human resumes; the resuming human is the actor ────
 def test_t2_resuming_human_not_the_starter_is_the_audited_actor():
@@ -140,15 +149,35 @@ def test_unbound_principal_is_refused_not_defaulted():
         runner.resume_thread(app["id"], {"decision": "proceed", "event_id": "evt:6"})
 
 
-def test_tenant_mismatch_is_refused_and_changes_nothing():
+def test_another_tenant_cannot_resume_or_see_the_thread():
+    """Braces: the checkpointer itself (RLS in Postgres, ownership in memory)
+    returns nothing for another tenant, so the runner sees no thread at all."""
     app = _seed(A)
     with use_tenant(A):
         runner.start_thread(app["id"])
     with use_tenant(B):
-        with pytest.raises(runner.TenantMismatch):
+        with pytest.raises(runner.OrchestratorError):
             runner.resume_thread(app["id"], {"decision": "reject", "event_id": "evt:7"})
+        assert runner.thread_status(app["id"]) is None
     with use_tenant(A):
         assert runner.thread_status(app["id"])["waiting_on"] == "review_gate"
+    assert _app(app["id"])["status"] != "rejected"
+
+
+def test_tenant_mismatch_belt_refuses_a_leaked_snapshot(monkeypatch):
+    """Belt: even if the checkpoint layer handed another tenant's state to the
+    runner, the runner compares the state's tenant with the bound principal."""
+    app = _seed(A)
+    with use_tenant(A):
+        runner.start_thread(app["id"])
+        g = graph_mod.get_graph()
+        leaked = g.get_state(runner._config(app["id"], runner._principal()))
+    monkeypatch.setattr(g, "get_state", lambda config: leaked)
+    with use_tenant(B):
+        with pytest.raises(runner.TenantMismatch):
+            runner.resume_thread(app["id"], {"decision": "reject", "event_id": "evt:7"})
+        with pytest.raises(runner.TenantMismatch):
+            runner.thread_status(app["id"])
     assert _app(app["id"])["status"] != "rejected"
 
 

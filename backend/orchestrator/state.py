@@ -46,6 +46,10 @@ def is_id(value: object) -> bool:
 
 IdStr = Annotated[str, IdMarker(), Field(pattern=ID_PATTERN)]
 
+# Every type a checkpoint may contain; registered with the serializer.
+__all__ = ["Gate", "Outcome", "ThreadStatus", "SendStatus", "ScoreSummary",
+           "Decision", "OutreachRef", "InterviewRef", "ThreadState"]
+
 
 class Gate(str, Enum):
     review = "review_gate"

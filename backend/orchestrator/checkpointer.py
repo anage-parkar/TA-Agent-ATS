@@ -31,12 +31,23 @@ from langchain_core.runnables import RunnableConfig
 from langgraph.checkpoint.base import ChannelVersions, Checkpoint, CheckpointMetadata, CheckpointTuple
 from langgraph.checkpoint.memory import InMemorySaver
 from langgraph.checkpoint.postgres import PostgresSaver
+from langgraph.checkpoint.serde.jsonplus import JsonPlusSerializer
 from psycopg.rows import dict_row
 
 from services.auth import is_dev_like
 from services.config import settings
 
 BACKENDS = ("postgres", "memory")
+
+
+def _serde() -> JsonPlusSerializer:
+    """The checkpoint serializer, with our state types registered explicitly.
+    LangGraph refuses (soon: blocks) deserialising unregistered types; graph
+    state is exactly the types in orchestrator.state and nothing else."""
+    from orchestrator import state as state_mod
+
+    allowed = [(state_mod.__name__, name) for name in state_mod.__all__]
+    return JsonPlusSerializer(allowed_msgpack_modules=allowed)
 
 
 class CheckpointerConfigError(RuntimeError):
@@ -209,9 +220,9 @@ def get_checkpointer() -> TenantPostgresSaver | TenantMemorySaver:
         if _instance is None:
             backend = resolve_backend()
             if backend == "postgres":
-                _instance = TenantPostgresSaver()
+                _instance = TenantPostgresSaver(serde=_serde())
             elif backend == "memory":
-                _instance = TenantMemorySaver()
+                _instance = TenantMemorySaver(serde=_serde())
             else:
                 raise CheckpointerConfigError(f"unknown CHECKPOINTER_BACKEND {backend!r}")
         return _instance
