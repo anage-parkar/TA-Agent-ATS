@@ -21,6 +21,7 @@ from db.supabase_client import close_pool, db_available
 from routers import admin, applications, candidates, dashboard, emails, interviews, jobs, jd_generation, legal, sourcing, website
 from services.auth import assert_safe_auth_config, bind_request_context
 from services.llm import get_gateway
+from services.llm.guard import assert_safe_llm_config
 
 logging.basicConfig(level=logging.INFO, format="%(levelname)s %(name)s: %(message)s")
 logger = logging.getLogger("ta_agent")
@@ -47,6 +48,9 @@ def _verify_llm() -> bool:
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
+    # The dev-only CLI LLM provider is refused outside dev — the same check the
+    # Celery worker runs at import of its app module (services.llm.guard).
+    assert_safe_llm_config()
     # Refuse to boot with an auth configuration that would let any caller
     # impersonate any tenant/user/role outside dev (services.auth).
     assert_safe_auth_config()

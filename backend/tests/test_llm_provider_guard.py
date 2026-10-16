@@ -79,3 +79,23 @@ def test_loading_the_celery_app_refuses_cli_outside_dev():
 def test_loading_the_celery_app_is_fine_in_dev_and_with_the_api_provider():
     assert _import_celery_app(APP_ENV="dev", LLM_PROVIDER="cli").returncode == 0
     assert _import_celery_app(APP_ENV="prod", LLM_PROVIDER="api").returncode == 0
+
+
+def test_api_lifespan_runs_the_guard(monkeypatch):
+    """The API process is the larger CLI caller (scoring, drafting): its
+    lifespan runs the same check, before the auth guard."""
+    import main
+    from fastapi.testclient import TestClient
+
+    monkeypatch.setattr(main, "_verify_llm", lambda: False)   # hermetic startup
+    monkeypatch.setattr(main, "db_available", lambda: False)
+    monkeypatch.setattr(settings, "trust_auth_headers", False)  # real auth: the auth guard passes
+
+    _cfg(monkeypatch, provider="cli", env="prod")
+    with pytest.raises(InsecureLLMConfig):
+        with TestClient(main.app):   # entering the client runs the lifespan
+            pass
+
+    _cfg(monkeypatch, provider="api", env="prod")
+    with TestClient(main.app) as client:
+        assert client.get("/health").status_code == 200
