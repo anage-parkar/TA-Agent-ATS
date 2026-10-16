@@ -142,6 +142,18 @@ def run_isolation_checks() -> bool:
         unbound_cp = conn.execute("select count(*) from checkpoints").fetchone()[0]
         results.append(check("unbound sees zero checkpoints (fail-closed)", unbound_cp, 0))
 
+        # Erasure deletes by thread_id across ALL checkpoint_ns values — the
+        # exact statement shape db/repository._delete_threads_db uses.
+        conn.execute("select set_config('app.tenant_id', %s, false)", (ORG_A,))
+        conn.execute("insert into checkpoints (thread_id, checkpoint_ns, checkpoint_id, checkpoint) "
+                     "values ('thread-a', 'score:child-task', 'c2', '{}'::jsonb)")
+        before = conn.execute("select count(distinct checkpoint_ns) from checkpoints "
+                              "where thread_id = 'thread-a'").fetchone()[0]
+        results.append(check("thread-a has a root and a subgraph namespace before erasure", before, 2))
+        conn.execute("delete from checkpoints where thread_id = any(%s)", (["thread-a"],))
+        after = conn.execute("select count(*) from checkpoints where thread_id = 'thread-a'").fetchone()[0]
+        results.append(check("delete by thread_id removes every namespace", after, 0))
+
         # The app role cannot create tables, so the package's setup() can never
         # run as it; the schema is owned by migration 0011.
         can_create = conn.execute(
