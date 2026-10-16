@@ -7,13 +7,19 @@ by id inside nodes; interrupt payloads shown to the UI are assembled at read
 time. Consequences: checkpoint erasure is defence in depth, version migrations
 stay small, checkpoints stay tiny.
 
-The structural guarantee is enforced by tests/test_phase2_storage.py, which
-walks this schema and fails on any free-text string field: a string is allowed
-only when annotated with ``IdMarker`` (see ``IdStr``).
+Two guarantees, enforced by tests/test_phase2_storage.py:
+
+* **structural** — the schema is walked and any string field not marked as an
+  identifier (``IdMarker`` *and* the ``ID_PATTERN`` constraint) fails;
+* **runtime** — an id-marked field validates its format on every assignment:
+  a UUID, or one of our prefixed ids (``system:scheduler``, ``evt:…``,
+  ``idem:<uuid>:send_gate:<event>``). A name or any free text is rejected by
+  pydantic, so marking a field as an id cannot smuggle prose through.
 """
 
 from __future__ import annotations
 
+import re
 from datetime import datetime
 from enum import Enum
 from typing import Annotated
@@ -25,9 +31,20 @@ class IdMarker:
     """Field metadata: this string is an opaque identifier, never free text."""
 
 
-# Identifiers: UUIDs, "system:<actor>" user ids, event ids. No whitespace, so
-# no prose can be smuggled in.
-IdStr = Annotated[str, IdMarker(), Field(pattern=r"^[A-Za-z0-9:_\-.]{1,128}$")]
+UUID_RE = r"[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}"
+# Prefixed ids: a lowercase namespace, a colon, then 1–5 colon-separated tokens
+# of [A-Za-z0-9_-.] — no whitespace, no '@', so neither prose nor an email fits.
+PREFIXED_ID_RE = r"[a-z][a-z0-9_]{0,15}:[A-Za-z0-9_\-.]{1,64}(?::[A-Za-z0-9_\-.]{1,64}){0,4}"
+ID_PATTERN = rf"^(?:{UUID_RE}|{PREFIXED_ID_RE})$"
+ID_RE = re.compile(ID_PATTERN)
+
+
+def is_id(value: object) -> bool:
+    """True when `value` has one of the accepted identifier formats."""
+    return isinstance(value, str) and ID_RE.fullmatch(value) is not None
+
+
+IdStr = Annotated[str, IdMarker(), Field(pattern=ID_PATTERN)]
 
 
 class Gate(str, Enum):
@@ -59,7 +76,7 @@ class SendStatus(str, Enum):
 
 
 class _Strict(BaseModel):
-    model_config = ConfigDict(extra="forbid")
+    model_config = ConfigDict(extra="forbid", validate_assignment=True)
 
 
 class ScoreSummary(_Strict):
@@ -78,7 +95,7 @@ class Decision(_Strict):
 
 class OutreachRef(_Strict):
     email_id: IdStr | None = None
-    idempotency_key: IdStr | None = None
+    idempotency_key: IdStr | None = None   # "idem:<application uuid>:<gate>:<event id>" (PR 3)
     send_status: SendStatus | None = None
 
 

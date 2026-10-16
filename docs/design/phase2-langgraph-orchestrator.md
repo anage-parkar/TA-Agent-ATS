@@ -101,8 +101,8 @@ candidate row. Redis remains Celery's broker only.
 
 - **Pinned package [condition]:** `langgraph-checkpoint-postgres==3.2.0`
   (latest on 2026-10-15), pinned together with `langgraph==1.2.4` and
-  `langgraph-checkpoint==4.1.1`; compatibility verified in the implementation
-  PR. `langgraph-checkpoint-redis` is removed.
+  `langgraph-checkpoint==4.3.0` (what 3.2.0 requires; PR 1 verified the
+  three resolve and import together). `langgraph-checkpoint-redis` is removed.
 - **Never run the built-in `setup()` as `app_user` [condition].** Migration
   `0011_checkpointer.sql` owns the DDL: the three tables (`checkpoints`,
   `checkpoint_blobs`, `checkpoint_writes`) vendored from the pinned version's
@@ -177,7 +177,8 @@ candidate row. Redis remains Celery's broker only.
 
 - **Idempotency key recorded before any Gmail call [condition].** On approval
   the node first inserts the `emails` row with `direction=outbound`,
-  `status=pending` and `idempotency_key = "{application_id}:send_gate:{approval_event_id}"`
+  `status=pending` and `idempotency_key = "idem:{application_id}:send_gate:{approval_event_id}"`
+  (prefixed so it validates as an id in graph state — PR 1's `ID_PATTERN`)
   (unique per tenant), commits, and only then calls Gmail with a deterministic
   `Message-ID: <{sha256(key)[:32]}@{outreach domain}>` header; success updates
   `status=sent` + `thread_id`. On retry or replay: key `sent` → skip;
