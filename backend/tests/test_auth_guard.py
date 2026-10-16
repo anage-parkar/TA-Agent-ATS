@@ -106,9 +106,11 @@ def test_explicit_override_allows_start_but_records_critical_event(monkeypatch, 
 def test_app_startup_runs_the_guard(monkeypatch):
     import main
 
-    # Keep startup hermetic: no LLM/DB probes in tests.
+    # Keep startup hermetic: no LLM/DB probes in tests, and the API provider
+    # regardless of the developer's .env (the lifespan's LLM guard runs first).
     monkeypatch.setattr(main, "_verify_llm", lambda: False)
     monkeypatch.setattr(main, "db_available", lambda: False)
+    monkeypatch.setattr(settings, "llm_provider", "api")
 
     _cfg(monkeypatch, app_env="prod")
     with pytest.raises(InsecureAuthConfig):
