@@ -87,8 +87,11 @@ def test_api_lifespan_runs_the_guard(monkeypatch):
     import main
     from fastapi.testclient import TestClient
 
+    import db.supabase_client as sc
+
     monkeypatch.setattr(main, "_verify_llm", lambda: False)   # hermetic startup
     monkeypatch.setattr(main, "db_available", lambda: False)
+    monkeypatch.setattr(sc, "db_available", lambda: True)      # the checkpointer guard's probe (prod => postgres)
     monkeypatch.setattr(settings, "trust_auth_headers", False)  # real auth: the auth guard passes
 
     _cfg(monkeypatch, provider="cli", env="prod")
