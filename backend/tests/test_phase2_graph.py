@@ -9,6 +9,7 @@ with a fake scorer (no LLM). The rollout flag is off everywhere: tests flip
 from __future__ import annotations
 
 import pytest
+from langgraph.types import Command
 
 from db import repository
 from db.repository import HumanActorRequired
@@ -284,3 +285,76 @@ def test_decision_endpoint_keeps_the_legacy_path_for_non_orchestrated_applicatio
     assert _app(app["id"])["status"] == "approved" and _app(app["id"])["stage"] == "Reviewed"
     with use_tenant(A):
         assert cp.get_checkpointer().get_tuple({"configurable": {"thread_id": app["id"], "checkpoint_ns": ""}}) is None
+
+
+# ── resume values are bound to their origin ───────────────────────────
+def test_crash_path_stale_system_resume_cannot_execute_under_a_human():
+    """A worker persisted a system 'reject' resume and died before the runner's
+    cleanup ran. The next human resume ('proceed') must not execute the stale
+    reject: the gate refuses the foreign envelope, the runner discards it and
+    delivers the human's own."""
+    app = _seed()
+    with use_tenant(A, user_id=RECRUITER_1):
+        runner.start_thread(app["id"])
+
+    # Simulate the crash: drive the graph directly with a system envelope and
+    # skip every runner failure handler.
+    with use_system(A, actor="orchestrator"):
+        p = runner._principal()
+        rid, envelope = runner._envelope(p, {"decision": "reject", "event_id": "evt:stale"})
+        with pytest.raises(HumanActorRequired):
+            graph_mod.get_graph().invoke(Command(resume=envelope), runner._config(app["id"], p, rid))
+    assert _app(app["id"])["status"] != "rejected"
+
+    with use_tenant(A, user_id=RECRUITER_2):
+        status = runner.resume_thread(app["id"], {"decision": "proceed", "event_id": "evt:human"})
+
+    assert _app(app["id"])["status"] == "approved"            # the human's decision, not the stale reject
+    assert status["waiting_on"] == "send_gate"
+    assert status["decisions"][-1]["outcome"] == "proceed" and status["decisions"][-1]["by"] == RECRUITER_2
+    discarded = _events("orchestrator.stale_resume_discarded", app["id"])
+    assert len(discarded) == 1
+    assert discarded[0]["actor_type"] == "human" and discarded[0]["actor_id"] == RECRUITER_2
+    assert discarded[0]["metadata"]["stale_resume_id"] == rid
+    assert discarded[0]["metadata"]["stale_principal"]["user_id"] == "system:orchestrator"
+
+
+def test_gate_refuses_an_envelope_from_another_principal_or_call():
+    """Belt for the binding itself: same thread, matching tenant, but the
+    envelope's principal or resume id is not this call's -> refused, nothing
+    mutated, thread still at the gate."""
+    app = _seed()
+    with use_tenant(A, user_id=RECRUITER_1):
+        runner.start_thread(app["id"])
+        p = runner._principal()
+        g = graph_mod.get_graph()
+        # (a) right id, wrong principal
+        rid, envelope = runner._envelope(p, {"decision": "proceed", "event_id": "evt:a"})
+        envelope["principal"] = {"tenant_id": A, "user_id": RECRUITER_2, "role": "recruiter"}
+        with pytest.raises(graph_mod.ResumeOriginMismatch):
+            g.invoke(Command(resume=envelope), runner._config(app["id"], p, rid))
+        runner._discard_pending(g, runner._config(app["id"], p))
+        # (b) right principal, id from a different call
+        _, envelope = runner._envelope(p, {"decision": "proceed", "event_id": "evt:b"})
+        with pytest.raises(graph_mod.ResumeOriginMismatch):
+            g.invoke(Command(resume=envelope), runner._config(app["id"], p, "rsm:someoneelse"))
+        runner._discard_pending(g, runner._config(app["id"], p))
+        # (c) a bare payload with no envelope at all
+        with pytest.raises(graph_mod.ResumeOriginMismatch):
+            g.invoke(Command(resume={"decision": "proceed"}), runner._config(app["id"], p, "rsm:x"))
+        runner._discard_pending(g, runner._config(app["id"], p))
+
+        assert _app(app["id"])["status"] not in ("approved", "rejected")
+        assert runner.thread_status(app["id"])["waiting_on"] == "review_gate"
+        # ...and a genuine resume through the runner still works afterwards
+        assert runner.resume_thread(app["id"], {"decision": "proceed", "event_id": "evt:c"})["waiting_on"] == "send_gate"
+
+
+def test_every_resume_call_mints_a_fresh_id_bound_to_the_caller():
+    with use_tenant(A, user_id=RECRUITER_1):
+        p = runner._principal()
+        r1, e1 = runner._envelope(p, {"decision": "proceed"})
+        r2, e2 = runner._envelope(p, {"decision": "proceed"})
+    assert r1 != r2 and e1["resume_id"] == r1 and e2["resume_id"] == r2
+    assert e1["principal"] == {"tenant_id": A, "user_id": RECRUITER_1, "role": "admin"}
+    assert e1["payload"] == {"decision": "proceed"}

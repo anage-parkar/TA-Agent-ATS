@@ -32,6 +32,7 @@ from __future__ import annotations
 
 import logging
 import uuid
+from contextvars import ContextVar
 from datetime import datetime, timezone
 from typing import Any
 
@@ -54,6 +55,48 @@ GRAPH_VERSION = 1
 
 GATE_NODES = ("review_gate", "send_gate", "interview_gate")
 EVENT_NODES = ("await_reply",)
+
+
+# ── resume binding ───────────────────────────────────────────────────────
+class ResumeOriginMismatch(RuntimeError):
+    """The resume value parked on the thread was not minted by this call.
+
+    LangGraph persists a Command(resume=...) value on the checkpoint BEFORE the
+    node runs, so a value from an earlier call (e.g. a system-planted reject
+    whose worker crashed before cleanup) can be handed to a later resume. The
+    runner therefore wraps every resume in an envelope carrying the resuming
+    principal and a one-time resume id, and a gate acts only on the envelope
+    whose principal and id match the current call's. Anything else is refused
+    here and cleared by the runner.
+    """
+
+    def __init__(self, stale: Any, expected: dict) -> None:
+        self.stale_resume_id = stale.get("resume_id") if isinstance(stale, dict) else None
+        self.stale_principal = stale.get("principal") if isinstance(stale, dict) else None
+        super().__init__(
+            f"resume value does not belong to this call: got resume_id={self.stale_resume_id!r} "
+            f"principal={self.stale_principal!r}, expected resume_id={expected.get('resume_id')!r} "
+            f"principal={expected.get('principal')!r}"
+        )
+
+
+# Set by _node for the duration of a node: what THIS call's resume must match.
+_binding: ContextVar[dict | None] = ContextVar("ta_resume_binding", default=None)
+
+
+def gate_interrupt(ref: dict[str, Any]) -> dict[str, Any]:
+    """`interrupt()` plus the origin check. Returns the caller's payload."""
+    envelope = interrupt(ref)
+    expected = _binding.get() or {}
+    if (
+        not isinstance(envelope, dict)
+        or not expected.get("resume_id")
+        or envelope.get("resume_id") != expected["resume_id"]
+        or envelope.get("principal") != expected["principal"]
+    ):
+        raise ResumeOriginMismatch(envelope, expected)
+    payload = envelope.get("payload")
+    return dict(payload) if isinstance(payload, dict) else {}
 
 
 # ── scoring port ─────────────────────────────────────────────────────────
@@ -104,11 +147,16 @@ def _node(fn):
     """
 
     def wrapped(state: ThreadState, config: RunnableConfig) -> dict[str, Any]:
-        raw = (config.get("configurable") or {}).get("principal")
+        conf = config.get("configurable") or {}
+        raw = conf.get("principal")
         if not raw:
             raise RuntimeError("graph invoked without a principal in config; use orchestrator.runner")
-        with use_principal(Principal(**raw)):
-            return fn(state)
+        token = _binding.set({"resume_id": conf.get("resume_id"), "principal": dict(raw)})
+        try:
+            with use_principal(Principal(**raw)):
+                return fn(state)
+        finally:
+            _binding.reset(token)
 
     wrapped.__name__ = fn.__name__
     wrapped.__doc__ = fn.__doc__
@@ -152,8 +200,8 @@ def score(state: ThreadState) -> dict[str, Any]:
 @_node
 def review_gate(state: ThreadState) -> dict[str, Any]:
     """Human decision: proceed or reject. No side effects before the interrupt."""
-    resume = interrupt(_ref(state, "review_gate"))
-    decision = (resume or {}).get("decision")
+    resume = gate_interrupt(_ref(state, "review_gate"))
+    decision = resume.get("decision")
     if decision not in ("proceed", "reject"):
         raise ValueError("review_gate resume requires decision 'proceed' or 'reject'")
     fields: dict[str, Any] = {
@@ -179,8 +227,8 @@ def _after_review(state: ThreadState) -> str:
 @_node
 def send_gate(state: ThreadState) -> dict[str, Any]:
     """Human approval to send outreach. PR 2 records the approval only."""
-    resume = interrupt(_ref(state, "send_gate"))
-    if not (resume or {}).get("approve"):
+    resume = gate_interrupt(_ref(state, "send_gate"))
+    if not resume.get("approve"):
         raise ValueError("send_gate resume requires approve: true")
     _require_human("approving outreach")
     decision = _decision(Gate.send, Outcome.approve, resume)
@@ -195,9 +243,9 @@ def send_gate(state: ThreadState) -> dict[str, Any]:
 @_node
 def await_reply(state: ThreadState) -> dict[str, Any]:
     """External wait: a typed event delivered by Celery (PR 4) resumes it."""
-    event = interrupt({"wait": "reply.received", "application_id": state.application_id,
-                       "graph_version": state.graph_version})
-    if (event or {}).get("event") != "reply.received":
+    event = gate_interrupt({"wait": "reply.received", "application_id": state.application_id,
+                            "graph_version": state.graph_version})
+    if event.get("event") != "reply.received":
         raise ValueError("await_reply resume requires event 'reply.received'")
     event_id = _event_id(event)
     events.emit_event(
@@ -211,8 +259,8 @@ def await_reply(state: ThreadState) -> dict[str, Any]:
 @_node
 def interview_gate(state: ThreadState) -> dict[str, Any]:
     """Human confirmation of an interview slot. PR 2 records the decision only."""
-    resume = interrupt(_ref(state, "interview_gate"))
-    if not (resume or {}).get("confirm"):
+    resume = gate_interrupt(_ref(state, "interview_gate"))
+    if not resume.get("confirm"):
         raise ValueError("interview_gate resume requires confirm: true")
     _require_human("confirming an interview")
     return {"decisions": [*state.decisions, _decision(Gate.interview, Outcome.confirm, resume)],
