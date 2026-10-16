@@ -57,3 +57,6 @@ jobs:
 
       - name: Apply migrations and verify RLS as app_user
         run: python backend/scripts/verify_rls.py
+
+      - name: Sensitivity — the same checks must FAIL for a role that bypasses RLS
+        run: python backend/scripts/verify_rls.py --sensitivity
