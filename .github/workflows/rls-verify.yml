@@ -43,8 +43,8 @@ jobs:
         with:
           python-version: "3.12"
 
-      - name: Install the DB driver
-        run: python -m pip install --quiet "psycopg[binary]>=3.2"
+      - name: Install dependencies (DB driver + the pinned LangGraph checkpointer)
+        run: python -m pip install --quiet -r backend/requirements.txt
 
       - name: Create the non-superuser login role
         # A plain login with NO direct table grants. The verifier makes it a
