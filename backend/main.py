@@ -19,6 +19,7 @@ from fastapi.staticfiles import StaticFiles
 from db.repository import HumanActorRequired
 from db.supabase_client import close_pool, db_available
 from routers import admin, applications, candidates, dashboard, emails, interviews, jobs, jd_generation, legal, sourcing, website
+from orchestrator.checkpointer import assert_safe_checkpointer_config
 from services.auth import assert_safe_auth_config, bind_request_context
 from services.llm import get_gateway
 from services.llm.guard import assert_safe_llm_config
@@ -54,6 +55,9 @@ async def lifespan(app: FastAPI):
     # Refuse to boot with an auth configuration that would let any caller
     # impersonate any tenant/user/role outside dev (services.auth).
     assert_safe_auth_config()
+    # Checkpoint storage is explicit config: memory is refused outside dev and a
+    # configured-but-unreachable Postgres fails startup (no silent fallback).
+    app.state.checkpointer = assert_safe_checkpointer_config()
     app.state.llm_ok = _verify_llm()
     app.state.db_ok = db_available()
     if not app.state.db_ok:

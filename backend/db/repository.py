@@ -1073,8 +1073,10 @@ _DOMAIN_STORES = {
     "pipeline_stages": _pipeline_stages,
     "interviews": _interviews,
 }
-# DB delete order respects FK dependencies (children first).
+# DB delete order respects FK dependencies (children first). Graph threads
+# (Phase 2 checkpoint tables) are not FK-linked and are RLS-scoped like the rest.
 _DELETE_ORDER = (
+    "checkpoint_writes", "checkpoint_blobs", "checkpoints",
     "activity_events", "ai_decisions", "scorecards", "consent_records",
     "eeo_records", "resumes", "pipeline_stages",
     "applications", "emails", "interviews", "job_members",
@@ -1088,17 +1090,90 @@ _EXPORT_TABLES = (
 )
 
 
+# ── Graph threads (Phase 2 checkpoint storage; thread_id = application id) ──
+_THREAD_TABLES = ("checkpoint_writes", "checkpoint_blobs", "checkpoints")   # children first
+_THREAD_EXPORT_TABLES = ("checkpoints", "checkpoint_blobs", "checkpoint_writes")
+
+
+def _jsonable(rows: list[dict]) -> list[dict]:
+    """bytea -> {"$base64": ...} so exports stay JSON-serialisable."""
+    import base64
+
+    def conv(v):
+        if isinstance(v, (bytes, bytearray, memoryview)):
+            return {"$base64": base64.b64encode(bytes(v)).decode("ascii")}
+        return v
+
+    return [{k: conv(v) for k, v in r.items()} for r in rows]
+
+
+def _export_threads_db(conn, thread_ids: list[str] | None) -> dict[str, list[dict]]:
+    """Thread rows (all three tables) for the given threads, or every thread the
+    bound tenant owns when thread_ids is None. RLS-scoped either way."""
+    out: dict[str, list[dict]] = {}
+    for t in _THREAD_EXPORT_TABLES:
+        if thread_ids is None:
+            cur = conn.execute(f"select * from {t}")
+        else:
+            cur = conn.execute(f"select * from {t} where thread_id = any(%s)", (list(thread_ids),))
+        out[t] = _jsonable(_rows(cur))
+    return out
+
+
+def _delete_threads_db(conn, thread_ids: list[str]) -> int:
+    """Delete the FULL history of each thread: every checkpoint, blob and write,
+    all namespaces and versions — not just the latest."""
+    if not thread_ids:
+        return 0
+    n = 0
+    for t in _THREAD_TABLES:
+        n += conn.execute(f"delete from {t} where thread_id = any(%s)", (list(thread_ids),)).rowcount
+    return n
+
+
+def _memory_saver():
+    from orchestrator.checkpointer import memory_saver_if_active  # lazy: orchestrator imports db
+
+    return memory_saver_if_active()
+
+
+def _memory_threads_export(thread_ids) -> dict[str, list[dict]]:
+    out: dict[str, list[dict]] = {t: [] for t in _THREAD_EXPORT_TABLES}
+    saver = _memory_saver()
+    if saver is None:
+        return out
+    for tid in thread_ids:
+        for k, rows in saver.export_thread(tid).items():
+            out[k].extend(rows)
+    return out
+
+
+def _memory_threads_delete(thread_ids) -> int:
+    saver = _memory_saver()
+    if saver is None:
+        return 0
+    n = 0
+    for tid in thread_ids:
+        if tid in saver.storage:
+            n += 1
+        saver.delete_thread(tid)
+    return n
+
+
 def export_tenant(tenant_id: str) -> dict[str, list[dict]]:
-    """Return every row owned by `tenant_id`, grouped by table."""
+    """Return every row owned by `tenant_id`, grouped by table (+ graph threads)."""
     if not db_available():
         with use_tenant(tenant_id):
-            return {name: list(_vals(store)) for name, store in _DOMAIN_STORES.items()}
+            out = {name: list(_vals(store)) for name, store in _DOMAIN_STORES.items()}
+            out["threads"] = _memory_threads_export([a["id"] for a in _vals(_applications)])
+            return out
 
     out: dict[str, list[dict]] = {}
     with use_tenant(tenant_id), tenant_connection() as conn:
         for table in _EXPORT_TABLES:
             cur = conn.execute(f"select * from {table}")  # RLS-scoped to tenant
             out[table] = _rows(cur)
+        out["threads"] = _export_threads_db(conn, None)  # RLS-scoped: this tenant's threads
     return out
 
 
@@ -1109,6 +1184,9 @@ def delete_tenant(tenant_id: str) -> dict[str, int]:
     """
     if not db_available():
         deleted: dict[str, int] = {}
+        with use_tenant(tenant_id):
+            deleted["threads"] = _memory_threads_delete(
+                [k for k, v in _applications.items() if v.get("tenant_id") == tenant_id])
         for name, store in _DOMAIN_STORES.items():
             ids = [k for k, v in store.items() if v.get("tenant_id") == tenant_id]
             for k in ids:
@@ -1199,11 +1277,13 @@ def export_candidate(candidate_id: str) -> Optional[dict]:
             "consent_records": [c for c in _vals(_consents) if c.get("candidate_id") == candidate_id],
             "eeo_records": [r for r in _vals(_eeo) if r.get("candidate_id") == candidate_id],
             "resumes": [r for r in _vals(_resumes) if r.get("candidate_id") == candidate_id],
+            "threads": _memory_threads_export(app_ids),
         }
     out = {"candidate": cand}
     with tenant_connection() as conn:
         out["applications"] = _rows(conn.execute(
             "select * from applications where candidate_id = %s", (candidate_id,)))
+        out["threads"] = _export_threads_db(conn, [a["id"] for a in out["applications"]])
         out["emails"] = _rows(conn.execute(
             "select e.* from emails e join applications a on a.id = e.application_id "
             "where a.candidate_id = %s", (candidate_id,)))
@@ -1242,15 +1322,21 @@ def erase_candidate(candidate_id: str) -> dict[str, int]:
         ):
             for k in [k for k, v in store.items() if v.get("candidate_id") == candidate_id]:
                 del store[k]; deleted[name] += 1
+        deleted["threads"] = _memory_threads_delete(app_ids)   # full graph-thread history
         _candidates.pop(candidate_id, None); deleted["candidate"] = 1
         _emit_audit("candidate.erased", "candidate", candidate_id, metadata={"deleted": deleted})
         return deleted
 
     with tenant_connection() as conn:
+        # Graph threads (thread_id = application id) are not FK-linked: delete
+        # their FULL history first, in this same transaction as the candidate.
+        app_ids = [r["id"] for r in _rows(conn.execute(
+            "select id from applications where candidate_id = %s", (candidate_id,)))]
+        threads = _delete_threads_db(conn, app_ids)
         # FK cascades from candidates → applications → emails/ai_decisions/scorecards,
         # and candidate-scoped consent/eeo/resumes also cascade on delete.
         cur = conn.execute("delete from candidates where id = %s", (candidate_id,))
-        deleted = {"candidate": cur.rowcount}
+        deleted = {"candidate": cur.rowcount, "threads": threads}
     _emit_audit("candidate.erased", "candidate", candidate_id, metadata={"deleted": deleted})
     return deleted
 

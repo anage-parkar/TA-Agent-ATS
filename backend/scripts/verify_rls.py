@@ -126,6 +126,39 @@ def run_isolation_checks() -> bool:
         unbound = conn.execute("select count(*) from jobs").fetchone()[0]
         results.append(check("unbound connection sees zero rows (fail-closed)", unbound, 0))
 
+        # ── Phase 2: LangGraph checkpoint tables are isolated the same way ──
+        conn.execute("select set_config('app.tenant_id', %s, false)", (ORG_A,))
+        conn.execute("insert into checkpoints (thread_id, checkpoint_id, checkpoint) "
+                     "values ('thread-a', 'c1', '{}'::jsonb)")
+        conn.execute("select set_config('app.tenant_id', %s, false)", (ORG_B,))
+        conn.execute("insert into checkpoints (thread_id, checkpoint_id, checkpoint) "
+                     "values ('thread-b', 'c1', '{}'::jsonb)")
+        seen_b = [r[0] for r in conn.execute("select thread_id from checkpoints").fetchall()]
+        results.append(check("tenant B sees only its own checkpoints (no WHERE)", seen_b, ["thread-b"]))
+        a_from_b = conn.execute(
+            "select count(*) from checkpoints where thread_id = 'thread-a'").fetchone()[0]
+        results.append(check("tenant B cannot read A's thread by id", a_from_b, 0))
+        conn.execute("select set_config('app.tenant_id', '', false)")
+        unbound_cp = conn.execute("select count(*) from checkpoints").fetchone()[0]
+        results.append(check("unbound sees zero checkpoints (fail-closed)", unbound_cp, 0))
+
+        # The app role cannot create tables, so the package's setup() can never
+        # run as it; the schema is owned by migration 0011.
+        can_create = conn.execute(
+            "select has_schema_privilege('app_user', 'public', 'CREATE')").fetchone()[0]
+        results.append(check("app_user has no CREATE on schema public", can_create, False))
+        try:
+            from langgraph.checkpoint.postgres import PostgresSaver
+        except ImportError:
+            print("  [SKIP] PostgresSaver.setup() check (langgraph-checkpoint-postgres not installed)")
+        else:
+            try:
+                PostgresSaver(conn).setup()
+                outcome = "ran"
+            except psycopg.errors.InsufficientPrivilege:
+                outcome = "refused"
+            results.append(check("PostgresSaver.setup() as app_user is refused", outcome, "refused"))
+
     return all(results)
 
 
@@ -134,6 +167,15 @@ def main() -> int:
     with psycopg.connect(ADMIN_URL, autocommit=True) as conn:
         apply_migrations(conn)
         setup_roles_and_orgs(conn)
+        try:
+            import langgraph.checkpoint.postgres.base as pg_base
+        except ImportError:
+            pass
+        else:
+            applied = conn.execute("select count(*) from checkpoint_migrations").fetchone()[0]
+            if not check("vendored checkpoint schema matches the pinned package's migration count",
+                         applied, len(pg_base.MIGRATIONS)):
+                return 1
     print(f"Running isolation checks as {TESTER_ROLE!r} with SET ROLE {APP_ROLE!r} ...")
     ok = run_isolation_checks()
     print("\nRESULT:", "ALL CHECKS PASSED" if ok else "FAILED")

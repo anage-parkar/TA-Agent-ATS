@@ -46,3 +46,6 @@ ta-project-*.json
 
 # Internal process brief (keep local; not part of the shipped repo)
 AI-Assisted Recruitment Process.pdf
+
+# Celery beat schedule (shelve files written next to the worker)
+celerybeat-schedule*
