@@ -28,6 +28,14 @@ from celery import Celery
 from celery.schedules import crontab
 
 from services.config import settings
+from services.llm.guard import assert_safe_llm_config
+
+# Worker-side production check: the Claude Code CLI LLM provider is for local
+# development only. It runs HERE, at import of the app module (which the
+# worker — and beat — load to start), so a misconfigured process never comes
+# up. A Celery signal handler would not do: Signal.send logs and swallows
+# handler exceptions instead of propagating them.
+assert_safe_llm_config()
 
 celery_app = Celery(
     "ta_agent",
