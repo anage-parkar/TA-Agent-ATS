@@ -1,0 +1,60 @@
+name: Merge gate
+
+# A PR may merge only while it carries the `ready-to-merge` label, and every
+# new push removes that label. The label is applied by hand, only when the PR
+# is finished: all commits pushed, both required checks green on the head
+# commit, and reported as ready. Make the job below a required status check
+# on `main` so the rule is enforced by GitHub, not by convention.
+#
+# How it behaves per event:
+#   synchronize (new push)  -> removes the label and FAILS
+#   labeled / unlabeled     -> re-evaluates: passes only with the label present
+#   opened / reopened /     -> evaluates the label as it stands (a fresh PR has
+#   ready_for_review           none, so it fails until labeled)
+
+on:
+  pull_request:
+    types: [opened, reopened, synchronize, ready_for_review, labeled, unlabeled]
+
+permissions:
+  contents: read
+  pull-requests: write
+
+jobs:
+  gate:
+    name: Merge gate (ready-to-merge label)
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    env:
+      LABEL: ready-to-merge
+
+    steps:
+      - name: New commits pushed — drop the label and fail
+        if: github.event.action == 'synchronize'
+        uses: actions/github-script@v7
+        with:
+          script: |
+            const label = process.env.LABEL;
+            try {
+              await github.rest.issues.removeLabel({
+                owner: context.repo.owner, repo: context.repo.repo,
+                issue_number: context.issue.number, name: label,
+              });
+              core.info(`Removed '${label}' after a new push.`);
+            } catch (e) {
+              if (e.status !== 404) throw e;   // 404: it wasn't there
+            }
+            core.setFailed(`New commits were pushed: '${label}' was removed. Re-apply it only when the PR is finished, all commits are pushed, both required checks are green on the head commit, and it has been reported as ready.`);
+
+      - name: Require the label
+        if: github.event.action != 'synchronize'
+        uses: actions/github-script@v7
+        with:
+          script: |
+            const label = process.env.LABEL;
+            const labels = (context.payload.pull_request.labels || []).map(l => l.name);
+            if (!labels.includes(label)) {
+              core.setFailed(`PR is not labeled '${label}'. It is applied only when the PR is finished, all commits are pushed, both required checks are green, and it has been reported as ready.`);
+            } else {
+              core.info(`'${label}' present — merge allowed.`);
+            }

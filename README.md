@@ -613,3 +613,12 @@ Beyond this original list, seven more workstreams have since shipped (see
 - LinkedIn scraping throttles to ≥3s between requests.
 - ATS score breakdowns are always stored and shown — no black-box scores.
 ```
+
+## Merge gate
+
+A pull request can merge only while it carries the `ready-to-merge` label, and
+every new push removes that label (`.github/workflows/merge-gate.yml`, a
+required check on `main`). The label is applied by hand, only when the PR is
+finished: all commits pushed, `Unit tests (pytest)` and `Verify tenant RLS as
+app_user` green on the head commit, and the PR reported as ready. Pushing
+after that means re-earning the label.
