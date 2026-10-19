@@ -29,7 +29,7 @@ from orchestrator import graph as graph_mod
 from orchestrator import migrations
 from orchestrator.graph import ResumeOriginMismatch
 from orchestrator.state import ThreadState, ThreadStatus
-from services import events, tenant_context
+from services import events, security_events, tenant_context
 from services.tenant_context import Principal, is_human_principal
 
 logger = logging.getLogger("ta_agent.orchestrator.runner")
@@ -173,6 +173,20 @@ def resume_thread(application_id: str, resume: dict[str, Any]) -> dict[str, Any]
     try:
         _attempt(g, config, envelope, application_id, resume, waiting_on)
     except ResumeOriginMismatch as exc:
+        if exc.kind == "forged":
+            # Not a leftover of an earlier legitimate call: malformed, from
+            # another tenant, or this call's id with another identity. Discarded
+            # by _attempt; recorded as a SECURITY event; no retry — surface it.
+            actor_type, actor_id = _actor()
+            security_events.record(
+                "orchestrator.resume_envelope_rejected", severity="critical",
+                application_id=application_id, waiting_on=waiting_on,
+                stale_resume_id=exc.stale_resume_id, stale_principal=exc.stale_principal,
+                actor_type=actor_type, actor_id=actor_id, tenant_id=p.tenant_id,
+            )
+            _emit("orchestrator.forged_resume_rejected", application_id, waiting_on=waiting_on,
+                  stale_resume_id=exc.stale_resume_id, stale_principal=exc.stale_principal)
+            raise
         # A value from an earlier call was parked on the thread (its worker
         # died before cleanup). The gate refused it and _attempt discarded it;
         # record that, then deliver THIS call's envelope, now the only one.

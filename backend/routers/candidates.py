@@ -18,6 +18,7 @@ from models.application import RecruiterDecision
 from models.candidate import CandidateProfile, SourceRequest
 from models.job import parsed_from_record
 from services import linkedin_enrich
+from services.outreach_send import OutreachRefused
 from services.config import settings
 from services.llm_client import LLMError
 
@@ -163,16 +164,34 @@ def recruiter_decision(application_id: str, decision: RecruiterDecision):
         # graph thread. The repository's human-actor gate still applies inside.
         from orchestrator import runner
 
+        # A combined "proceed and send" click is still TWO approvals: two
+        # resumes under the same principal, two audit events sharing an
+        # action_group_id (design note §5).
+        group = f"grp:{uuid.uuid4().hex}"
+        if decision.send and decision.decision != "proceed":
+            raise HTTPException(status_code=400, detail="send approval only applies to 'proceed'")
         try:
             thread = runner.resume_thread(
                 application_id,
-                {"decision": decision.decision, "event_id": f"evt:{uuid.uuid4().hex}"},
+                {"decision": decision.decision, "event_id": f"evt:{uuid.uuid4().hex}",
+                 "action_group_id": group},
             )
+            if decision.send and decision.send.approve and thread.get("waiting_on") == "send_gate":
+                thread = runner.resume_thread(
+                    application_id,
+                    {"approve": True, "subject": decision.send.subject, "body": decision.send.body,
+                     "event_id": f"evt:{uuid.uuid4().hex}", "action_group_id": group},
+                )
         except runner.OrchestratorError as exc:
+            raise HTTPException(status_code=409, detail=str(exc)) from exc
+        except OutreachRefused as exc:
             raise HTTPException(status_code=409, detail=str(exc)) from exc
         refreshed = repository.get_application(application_id) or current
         return {"application_id": application_id, "status": refreshed.get("status"),
-                "stage": refreshed.get("stage"), "thread": thread}
+                "stage": refreshed.get("stage"), "thread": thread, "action_group_id": group}
+
+    if decision.send is not None:
+        raise HTTPException(status_code=409, detail="combined send approval requires an orchestrated application")
 
     status = "approved" if decision.decision == "proceed" else "rejected"
     fields = {"status": status, "recruiter_decision": decision.decision}

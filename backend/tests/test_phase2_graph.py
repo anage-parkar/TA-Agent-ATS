@@ -17,6 +17,7 @@ from orchestrator import checkpointer as cp
 from orchestrator import graph as graph_mod
 from orchestrator import runner
 from orchestrator.state import ScoreSummary
+from services.outreach_send import SendResult
 from services.config import settings
 from services.tenant_context import use_system, use_tenant
 
@@ -42,6 +43,8 @@ def _memory_everything(monkeypatch):
     # No LLM in tests: scoring returns a fixed, above-threshold summary.
     monkeypatch.setattr(graph_mod, "score_application",
                         lambda application: ScoreSummary(overall=72.0, passed_knockouts=True, below_threshold=False))
+    # No mailbox in tests: the send port records a sent ledger row and nothing more.
+    monkeypatch.setattr(graph_mod, "send_outreach", _fake_send)
     for name in _ALL_STORES:
         getattr(repository, name).clear()
     yield
@@ -49,6 +52,18 @@ def _memory_everything(monkeypatch):
     graph_mod.reset_graph()
     for name in _ALL_STORES:
         getattr(repository, name).clear()
+
+
+def _fake_send(application_id, *, event_id, subject, body):
+    row = repository.create_email({
+        "application_id": application_id, "direction": "outbound", "subject": subject, "body": body,
+        "idempotency_key": f"idem:{application_id}:send_gate:{event_id}", "send_status": "sent",
+        "message_id": "<ta-fake@example.com>", "sent_at": "2026-10-19T00:00:00+00:00", "thread_id": "t-fake",
+    })
+    return SendResult(row, "sent")
+
+
+APPROVE = {"approve": True, "subject": "Next steps", "body": "Hello"}
 
 
 def _seed(tenant=A, orchestrated=True) -> dict:
@@ -126,9 +141,11 @@ def test_t3_system_resume_with_an_event_succeeds_and_is_audited_to_the_orchestra
         runner.start_thread(app["id"])
         assert runner.resume_thread(app["id"], {"decision": "proceed", "event_id": "evt:3"})["waiting_on"] == "send_gate"
         assert _app(app["id"])["status"] == "approved" and _app(app["id"])["stage"] == "Reviewed"
-        status = runner.resume_thread(app["id"], {"approve": True, "event_id": "evt:4"})
+        status = runner.resume_thread(app["id"], {**APPROVE, "event_id": "evt:4"})
     assert status["status"] == "waiting_event" and status["waiting_on"] == "await_reply"
-    assert repository._emails == {}                           # PR 2 records approval only; nothing is sent
+    sent_rows = [e for e in repository._emails.values() if e.get("direction") == "outbound"]
+    assert len(sent_rows) == 1 and sent_rows[0]["send_status"] == "sent"   # ledger row from the send port
+    assert _app(app["id"])["stage"] == "Outreach"
 
     with use_system(A, actor="orchestrator"):
         status = runner.resume_thread(app["id"], {"event": "reply.received", "event_id": "evt:5"})

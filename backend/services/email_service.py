@@ -12,6 +12,7 @@ from __future__ import annotations
 
 import base64
 import logging
+import socket
 from email.mime.multipart import MIMEMultipart
 from email.mime.text import MIMEText
 
@@ -24,6 +25,56 @@ _GMAIL_SCOPES = [
     "https://www.googleapis.com/auth/gmail.send",
     "https://www.googleapis.com/auth/gmail.readonly",
 ]
+
+
+class SendError(RuntimeError):
+    """Base for provider send failures."""
+
+
+class AmbiguousSendError(SendError):
+    """The message MAY have been sent (timeout, connection loss, 5xx). The
+    ledger marks the attempt `unknown` and resolves it by mailbox lookup."""
+
+
+class DefiniteSendError(SendError):
+    """The message was NOT sent (4xx / bad request / not configured)."""
+
+
+def classify_send_error(exc: Exception) -> type[SendError]:
+    """Ambiguous unless the provider told us definitively that nothing was
+    sent. Unknown exception types are ambiguous: we can never assume not-sent."""
+    try:
+        from googleapiclient.errors import HttpError
+    except ImportError:  # pragma: no cover
+        HttpError = ()  # type: ignore[assignment]
+    if HttpError and isinstance(exc, HttpError):
+        status = getattr(getattr(exc, "resp", None), "status", None)
+        try:
+            status = int(status)
+        except (TypeError, ValueError):
+            status = None
+        return AmbiguousSendError if status is None or status >= 500 else DefiniteSendError
+    if isinstance(exc, (TimeoutError, socket.timeout, ConnectionError, OSError)):
+        return AmbiguousSendError
+    return AmbiguousSendError
+
+
+def build_message(to: str, subject: str, body: str, *, decision: str = "proceed",
+                  opt_out_url: str | None = None, message_id: str | None = None,
+                  idempotency_key: str | None = None) -> MIMEMultipart:
+    """The branded HTML message (plain-text fallback), optionally carrying the
+    two replay-detection headers the send ledger sets."""
+    msg = MIMEMultipart("alternative")
+    msg["to"] = to
+    msg["from"] = settings.outreach_from_email or "me"
+    msg["subject"] = subject
+    if message_id:
+        msg["Message-ID"] = message_id
+    if idempotency_key:
+        msg["X-TA-Idempotency-Key"] = idempotency_key
+    msg.attach(MIMEText(email_templates.plain_fallback(body, opt_out_url), "plain", "utf-8"))
+    msg.attach(MIMEText(email_templates.render_html(body, decision, opt_out_url), "html", "utf-8"))
+    return msg
 
 
 def _real(v: str) -> bool:
@@ -61,24 +112,56 @@ def _service():
 
 
 def send_email(
-    to: str, subject: str, body: str, decision: str = "proceed", opt_out_url: str | None = None
+    to: str, subject: str, body: str, decision: str = "proceed", opt_out_url: str | None = None,
+    *, message_id: str | None = None, idempotency_key: str | None = None,
 ) -> dict:
     """Send a branded HTML email (with plain-text fallback) from the recruiter's
-    Gmail. Returns {thread_id, message_id}."""
+    Gmail. Returns {thread_id, message_id}. Provider failures are raised as
+    AmbiguousSendError / DefiniteSendError (see classify_send_error); an
+    unconfigured mailbox is a DefiniteSendError (nothing was sent)."""
+    ok, reason = availability()
+    if not ok:
+        raise DefiniteSendError(reason)
+
+    msg = build_message(to, subject, body, decision=decision, opt_out_url=opt_out_url,
+                        message_id=message_id, idempotency_key=idempotency_key)
+    raw = base64.urlsafe_b64encode(msg.as_bytes()).decode()
+
+    try:
+        sent = _service().users().messages().send(userId="me", body={"raw": raw}).execute()
+    except Exception as exc:  # noqa: BLE001 — classified, never swallowed
+        raise classify_send_error(exc)(f"{type(exc).__name__}: {str(exc)[:300]}") from exc
+    return {"thread_id": sent.get("threadId"), "message_id": sent.get("id")}
+
+
+def find_sent_message(*, message_id: str | None = None, idempotency_key: str | None = None,
+                      to: str | None = None, days: int = 7) -> dict | None:
+    """Was an attempt actually sent? Looks for the deterministic Message-ID
+    first (`rfc822msgid:`), then for the X-TA-Idempotency-Key header on recent
+    sent mail to the recipient. Returns {message_id, thread_id, matched_by} or
+    None. Raises on mailbox errors (callers must not treat that as 'not sent')."""
     ok, reason = availability()
     if not ok:
         raise RuntimeError(reason)
-
-    msg = MIMEMultipart("alternative")
-    msg["to"] = to
-    msg["from"] = settings.outreach_from_email or "me"
-    msg["subject"] = subject
-    msg.attach(MIMEText(email_templates.plain_fallback(body, opt_out_url), "plain", "utf-8"))
-    msg.attach(MIMEText(email_templates.render_html(body, decision, opt_out_url), "html", "utf-8"))
-    raw = base64.urlsafe_b64encode(msg.as_bytes()).decode()
-
-    sent = _service().users().messages().send(userId="me", body={"raw": raw}).execute()
-    return {"thread_id": sent.get("threadId"), "message_id": sent.get("id")}
+    svc = _service()
+    if message_id:
+        res = svc.users().messages().list(
+            userId="me", q=f"rfc822msgid:{message_id.strip('<>')}", maxResults=5).execute()
+        for m in res.get("messages", []) or []:
+            return {"message_id": m["id"], "thread_id": m.get("threadId"), "matched_by": "message_id"}
+    if idempotency_key:
+        q = f"in:sent newer_than:{days}d" + (f" to:{to}" if to else "")
+        res = svc.users().messages().list(userId="me", q=q, maxResults=25).execute()
+        for m in res.get("messages", []) or []:
+            full = svc.users().messages().get(
+                userId="me", id=m["id"], format="metadata",
+                metadataHeaders=["X-TA-Idempotency-Key"]).execute()
+            headers = {h["name"].lower(): h["value"]
+                       for h in (full.get("payload") or {}).get("headers", [])}
+            if (headers.get("x-ta-idempotency-key") or "").strip() == idempotency_key:
+                return {"message_id": full["id"], "thread_id": full.get("threadId"),
+                        "matched_by": "idempotency_header"}
+    return None
 
 
 def _plain_text(payload: dict) -> str:
