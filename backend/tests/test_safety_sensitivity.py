@@ -28,6 +28,9 @@ from tests import test_phase2_storage as t_store
 from tests import test_rbac as t_rbac
 from tests import test_tenant_isolation as t_tenant
 from tests import test_workstream_c as t_gate
+from orchestrator import graph as graph_mod
+from services import email_service, outreach_send
+from tests import test_phase2_send as t_send
 
 _ALL_STORES = (
     "_jobs", "_candidates", "_applications", "_emails", "_generated_jds", "_orgs",
@@ -54,9 +57,12 @@ def _clear_stores():
 
 
 def _must_fail(test_fn, *args):
-    """The original test must fail (an assertion or pytest's DID NOT RAISE)."""
+    """The original test must NOT pass with the guard removed: an assertion,
+    pytest's DID NOT RAISE, or any error raised by a remaining layer (e.g. the
+    unique index behind a removed ledger lookup) all count — a test that errors
+    does not pass. _must_pass is what proves it passes with the guard intact."""
     _clear_stores()
-    with pytest.raises((AssertionError, Failed)):
+    with pytest.raises((Exception, Failed)):
         test_fn(*args)
 
 
@@ -167,3 +173,40 @@ def test_runtime_id_validation_test_fails_when_the_pattern_is_dropped(monkeypatc
         m.setattr(t_store, "ThreadState", Unconstrained)
         _must_fail(t_store.test_id_marked_fields_reject_non_id_values_at_runtime, "Ada Lovelace")
     _must_pass(t_store.test_id_marked_fields_reject_non_id_values_at_runtime, "Ada Lovelace")
+
+
+# ── Phase 2 / PR 3: the send gate's guards (same-PR rule) ──────────────
+def test_send_idempotency_test_fails_when_the_ledger_lookup_is_removed(monkeypatch):
+    with monkeypatch.context() as m:
+        m.setattr(repository, "get_email_by_idempotency_key", lambda key: None)   # every send looks new
+        _must_fail(t_send.test_same_key_never_sends_twice)
+    _must_pass(t_send.test_same_key_never_sends_twice)
+
+
+def test_unknown_status_test_fails_when_ambiguity_is_classified_as_definite(monkeypatch):
+    with monkeypatch.context() as m:
+        m.setattr(email_service, "classify_send_error", lambda exc: email_service.DefiniteSendError)
+        m.setattr(email_service, "AmbiguousSendError", email_service.DefiniteSendError)  # 5xx treated as "not sent"
+        _must_fail(t_send.test_ambiguous_errors_mark_unknown_not_failed)
+    _must_pass(t_send.test_ambiguous_errors_mark_unknown_not_failed)
+
+
+def test_resolution_rule_test_fails_when_resolution_is_skipped(monkeypatch):
+    with monkeypatch.context() as m:
+        m.setattr(outreach_send, "resolve_unresolved", lambda application_id, to: [])  # re-approval mints blindly
+        _must_fail(t_send.test_reapproval_resolves_previous_attempt_before_minting)
+    _must_pass(t_send.test_reapproval_resolves_previous_attempt_before_minting)
+
+
+def test_forged_envelope_security_event_test_fails_when_classification_is_removed(monkeypatch):
+    with monkeypatch.context() as m:
+        m.setattr(graph_mod, "_classify", lambda envelope, expected: "stale")        # everything looks stale
+        _must_fail(t_send.test_forged_envelope_writes_a_security_event, "bare_payload")
+    _must_pass(t_send.test_forged_envelope_writes_a_security_event, "bare_payload")
+
+
+def test_human_only_send_approval_test_fails_when_the_check_is_removed(monkeypatch):
+    with monkeypatch.context() as m:
+        m.setattr(graph_mod, "_require_human", lambda action: None)                  # the system may approve
+        _must_fail(t_send.test_system_cannot_approve_send)
+    _must_pass(t_send.test_system_cannot_approve_send)
