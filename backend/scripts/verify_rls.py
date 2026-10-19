@@ -86,13 +86,18 @@ def check(label: str, got, expected) -> bool:
     return ok
 
 
-def run_isolation_checks() -> bool:
+def run_isolation_checks(conninfo: str | None = None, *, as_app_role: bool = True, tag: str = "") -> bool:
+    """The isolation checks. Normally run as the login role with SET ROLE
+    app_user. With `as_app_role=False` they run as whatever `conninfo` is
+    (the superuser, in --sensitivity mode) and are EXPECTED to fail — that is
+    how we know the checks can detect a role that bypasses RLS."""
     results = []
-    with psycopg.connect(_tester_url(), autocommit=True) as conn:
+    with psycopg.connect(conninfo or _tester_url(), autocommit=True) as conn:
         # Act as the production app role (NOLOGIN → reachable only via SET ROLE)
         # and prove it is neither a superuser nor BYPASSRLS before trusting any
         # of the checks below.
-        conn.execute(sql.SQL("set role {}").format(sql.Identifier(APP_ROLE)))
+        if as_app_role:
+            conn.execute(sql.SQL("set role {}").format(sql.Identifier(APP_ROLE)))
         privs = conn.execute(
             "select current_user, rolsuper, rolbypassrls from pg_roles where rolname = current_user"
         ).fetchone()
@@ -128,15 +133,16 @@ def run_isolation_checks() -> bool:
 
         # ── Phase 2: LangGraph checkpoint tables are isolated the same way ──
         conn.execute("select set_config('app.tenant_id', %s, false)", (ORG_A,))
+        ta, tb = f"thread-a{tag}", f"thread-b{tag}"
         conn.execute("insert into checkpoints (thread_id, checkpoint_id, checkpoint) "
-                     "values ('thread-a', 'c1', '{}'::jsonb)")
+                     "values (%s, 'c1', '{}'::jsonb)", (ta,))
         conn.execute("select set_config('app.tenant_id', %s, false)", (ORG_B,))
         conn.execute("insert into checkpoints (thread_id, checkpoint_id, checkpoint) "
-                     "values ('thread-b', 'c1', '{}'::jsonb)")
+                     "values (%s, 'c1', '{}'::jsonb)", (tb,))
         seen_b = [r[0] for r in conn.execute("select thread_id from checkpoints").fetchall()]
-        results.append(check("tenant B sees only its own checkpoints (no WHERE)", seen_b, ["thread-b"]))
+        results.append(check("tenant B sees only its own checkpoints (no WHERE)", seen_b, [tb]))
         a_from_b = conn.execute(
-            "select count(*) from checkpoints where thread_id = 'thread-a'").fetchone()[0]
+            "select count(*) from checkpoints where thread_id = %s", (ta,)).fetchone()[0]
         results.append(check("tenant B cannot read A's thread by id", a_from_b, 0))
         conn.execute("select set_config('app.tenant_id', '', false)")
         unbound_cp = conn.execute("select count(*) from checkpoints").fetchone()[0]
@@ -146,12 +152,12 @@ def run_isolation_checks() -> bool:
         # exact statement shape db/repository._delete_threads_db uses.
         conn.execute("select set_config('app.tenant_id', %s, false)", (ORG_A,))
         conn.execute("insert into checkpoints (thread_id, checkpoint_ns, checkpoint_id, checkpoint) "
-                     "values ('thread-a', 'score:child-task', 'c2', '{}'::jsonb)")
+                     "values (%s, 'score:child-task', 'c2', '{}'::jsonb)", (ta,))
         before = conn.execute("select count(distinct checkpoint_ns) from checkpoints "
-                              "where thread_id = 'thread-a'").fetchone()[0]
+                              "where thread_id = %s", (ta,)).fetchone()[0]
         results.append(check("thread-a has a root and a subgraph namespace before erasure", before, 2))
-        conn.execute("delete from checkpoints where thread_id = any(%s)", (["thread-a"],))
-        after = conn.execute("select count(*) from checkpoints where thread_id = 'thread-a'").fetchone()[0]
+        conn.execute("delete from checkpoints where thread_id = any(%s)", ([ta],))
+        after = conn.execute("select count(*) from checkpoints where thread_id = %s", (ta,)).fetchone()[0]
         results.append(check("delete by thread_id removes every namespace", after, 0))
 
         # The app role cannot create tables, so the package's setup() can never
@@ -174,7 +180,22 @@ def run_isolation_checks() -> bool:
     return all(results)
 
 
+def sensitivity() -> int:
+    """Prove the checks can fail: run them as the superuser (which bypasses
+    RLS) and require that they do NOT all pass. A green run here means the
+    isolation checks are sensitive to a bypassing role; a run that passes as
+    the superuser would mean the checks prove nothing."""
+    print("Sensitivity: running the isolation checks as the SUPERUSER (bypasses RLS) ...")
+    all_passed = run_isolation_checks(ADMIN_URL, as_app_role=False, tag="-sens")
+    sensitive = not all_passed
+    print("\nSENSITIVITY:", "OK — the checks fail for a role that bypasses RLS"
+          if sensitive else "BROKEN — the checks pass even for a BYPASSRLS superuser")
+    return 0 if sensitive else 1
+
+
 def main() -> int:
+    if "--sensitivity" in sys.argv:
+        return sensitivity()
     print(f"Applying migrations from {MIGRATIONS} to {ADMIN_URL} ...")
     with psycopg.connect(ADMIN_URL, autocommit=True) as conn:
         apply_migrations(conn)
