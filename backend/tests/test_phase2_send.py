@@ -57,6 +57,7 @@ class FakeGmail:
         self.in_mailbox_ids: set[str] = set()
         self.in_mailbox_keys: set[str] = set()
         self.before_send = None
+        self.lookup_script: list[bool] = []   # scripted answers (True = found) consumed before the sets
 
     def send_email(self, to, subject, body, decision="proceed", opt_out_url=None, *,
                    message_id=None, idempotency_key=None):
@@ -74,6 +75,10 @@ class FakeGmail:
 
     def find_sent_message(self, *, message_id=None, idempotency_key=None, to=None, days=7):
         self.lookups.append({"message_id": message_id, "idempotency_key": idempotency_key, "to": to})
+        if self.lookup_script:
+            if self.lookup_script.pop(0):
+                return {"message_id": "g-found", "thread_id": "t-found", "matched_by": "message_id"}
+            return None
         if message_id and message_id in self.in_mailbox_ids:
             return {"message_id": "g-found", "thread_id": "t-found", "matched_by": "message_id"}
         if idempotency_key and idempotency_key in self.in_mailbox_keys:
@@ -101,6 +106,7 @@ def _world():
     mp.setattr(email_service, "find_sent_message", gmail.find_sent_message)
     mp.setattr(graph_mod, "score_application",
                lambda a: ScoreSummary(overall=72.0, passed_knockouts=True, below_threshold=False))
+    mp.setattr(outreach_send, "LOOKUP_RETRY_DELAY_SECONDS", 0.0)
     security_events.clear_sinks()
     security_events.register_sink(captured.append)
     cp.reset_checkpointer()
@@ -136,6 +142,12 @@ def _to_send_gate(app: dict) -> None:
 def _events(action: str, entity_id: str) -> list[dict]:
     return [e for e in repository._activity_events.values()
             if e.get("action") == action and e.get("entity_id") == entity_id]
+
+
+def _age(row: dict, seconds: int) -> None:
+    """Pretend the attempt was created `seconds` ago."""
+    from datetime import datetime, timedelta, timezone
+    repository._emails[row["id"]]["created_at"] = (datetime.now(timezone.utc) - timedelta(seconds=seconds)).isoformat()
 
 
 def _outbound(app_id: str) -> list[dict]:
@@ -176,15 +188,19 @@ def test_same_key_never_sends_twice():
 def test_ambiguous_errors_mark_unknown_not_failed():
     with _world() as (gmail, _):
         app = _seed()
+        to = "ada@candidate.example"
         with use_tenant(A, user_id=R1):
             gmail.mode = "timeout"                                  # a raw exception, classified by the ledger
-            res = outreach_send.send_for_application(app["id"], event_id="evt:a", subject="S", body="B")
+            res = outreach_send.send_with_ledger(application_id=app["id"], to=to, subject="S", body="B",
+                                                 key=outreach_send.idempotency_key(app["id"], "send_gate", "evt:a"))
             assert res.action == "unknown" and res.email["send_status"] == "unknown"
             gmail.mode = "ambiguous"
-            res = outreach_send.send_for_application(app["id"], event_id="evt:b", subject="S", body="B")
+            res = outreach_send.send_with_ledger(application_id=app["id"], to=to, subject="S", body="B",
+                                                 key=outreach_send.idempotency_key(app["id"], "send_gate", "evt:b"))
             assert res.email["send_status"] == "unknown"
             gmail.mode = "definite"
-            res = outreach_send.send_for_application(app["id"], event_id="evt:c", subject="S", body="B")
+            res = outreach_send.send_with_ledger(application_id=app["id"], to=to, subject="S", body="B",
+                                                 key=outreach_send.idempotency_key(app["id"], "send_gate", "evt:c"))
             assert res.action == "failed" and res.email["send_status"] == "failed"
 
 
@@ -214,10 +230,12 @@ def test_unknown_attempt_not_in_mailbox_is_resent_under_the_same_key():
             gmail.mode = "ambiguous"
             first = outreach_send.send_with_ledger(application_id=app["id"], to="ada@candidate.example",
                                                   subject="S", body="B", key=key)
+            _age(first.email, 600)                                  # old enough for a negative lookup to count
             gmail.mode = "ok"
             res = outreach_send.send_with_ledger(application_id=app["id"], to="ada@candidate.example",
                                                  subject="S", body="B", key=key)
         assert res.action == "sent" and res.email["id"] == first.email["id"]
+        assert len(gmail.lookups) >= outreach_send.LOOKUP_ATTEMPTS         # retried before resending
         assert [s["message_id"] for s in gmail.sent] == [first.email["message_id"]] * 2  # same deterministic id
         assert len(_outbound(app["id"])) == 1
 
@@ -255,12 +273,14 @@ def test_reapproval_after_a_confirmed_failure_mints_a_new_key():
         with use_tenant(A, user_id=R2):
             gmail.mode = "ambiguous"
             runner.resume_thread(app["id"], {**APPROVE, "event_id": "evt:2"})
-            gmail.mode = "ok"                                        # mailbox empty: the lookup finds nothing
+            _age(_outbound(app["id"])[0], 600)                       # old enough, and the lookups will all miss
+            gmail.mode = "ok"
             status = runner.resume_thread(app["id"], {**APPROVE, "event_id": "evt:3"})
         assert status["waiting_on"] == "await_reply"
         rows = _outbound(app["id"])
         assert [r["send_status"] for r in rows] == ["failed", "sent"]
         assert rows[0]["idempotency_key"] != rows[1]["idempotency_key"]
+        assert rows[0]["resolve_attempts"] >= outreach_send.LOOKUP_ATTEMPTS
         assert len(gmail.sent) == 2
 
 
@@ -423,3 +443,62 @@ def test_legacy_send_route_is_unchanged():
             assert gmail.sent == []
         finally:
             mp.undo()
+
+
+# ── search indexing lag: age + retried lookups before a negative counts ─
+def test_lookup_misses_then_finds_on_retry_and_nothing_is_sent_twice():
+    with _world() as (gmail, _):
+        app = _seed()
+        _to_send_gate(app)
+        with use_tenant(A, user_id=R2):
+            gmail.mode = "ambiguous"
+            runner.resume_thread(app["id"], {**APPROVE, "event_id": "evt:2"})
+            first = _outbound(app["id"])[0]
+            assert first["send_status"] == "unknown"
+            gmail.mode = "ok"
+            gmail.lookup_script = [False, True]                       # index lag: miss, then found on retry
+            status = runner.resume_thread(app["id"], {**APPROVE, "event_id": "evt:3"})
+        assert status["waiting_on"] == "await_reply"
+        rows = _outbound(app["id"])
+        assert len(rows) == 1 and rows[0]["send_status"] == "sent"   # resolved, no new key
+        assert len(gmail.sent) == 1                                  # no second send
+        assert len(gmail.lookups) == 2 and rows[0]["resolve_attempts"] == 2
+
+
+def test_negative_lookup_on_a_young_unknown_attempt_does_not_mint_a_new_key():
+    with _world() as (gmail, _):
+        app = _seed()
+        _to_send_gate(app)
+        with use_tenant(A, user_id=R2):
+            gmail.mode = "ambiguous"
+            runner.resume_thread(app["id"], {**APPROVE, "event_id": "evt:2"})
+            gmail.mode = "ok"                                        # mailbox empty, attempt seconds old
+            with pytest.raises(outreach_send.OutreachUnresolved):
+                runner.resume_thread(app["id"], {**APPROVE, "event_id": "evt:3"})
+            assert runner.thread_status(app["id"])["waiting_on"] == "send_gate"
+        rows = _outbound(app["id"])
+        assert len(rows) == 1 and rows[0]["send_status"] == "unknown"   # still unresolved, no new key
+        assert rows[0]["resolve_attempts"] >= outreach_send.LOOKUP_ATTEMPTS
+        assert len(gmail.sent) == 1
+
+
+def test_negative_lookup_counts_only_when_old_enough_and_retried():
+    with _world() as (gmail, _):
+        app = _seed()
+        key = outreach_send.idempotency_key(app["id"], "send_gate", "evt:1")
+        with use_tenant(A, user_id=R1):
+            gmail.mode = "ambiguous"
+            first = outreach_send.send_with_ledger(application_id=app["id"], to="ada@candidate.example",
+                                                  subject="S", body="B", key=key)
+            gmail.mode = "ok"
+            # old enough but the retry budget is not met yet (a single lookup)
+            _age(first.email, 600)
+            with pytest.MonkeyPatch.context() as m:
+                m.setattr(outreach_send, "LOOKUP_ATTEMPTS", 1)
+                with pytest.raises(outreach_send.OutreachUnresolved):
+                    outreach_send.send_with_ledger(application_id=app["id"], to="ada@candidate.example",
+                                                   subject="S", body="B", key=key)
+            # retried enough now (attempts accumulate across calls) and old: a negative counts
+            res = outreach_send.send_with_ledger(application_id=app["id"], to="ada@candidate.example",
+                                                 subject="S", body="B", key=key)
+        assert res.action == "sent" and res.email["resolve_attempts"] >= outreach_send.MIN_LOOKUPS_BEFORE_FAILED
