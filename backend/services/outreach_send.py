@@ -24,6 +24,7 @@ from __future__ import annotations
 
 import hashlib
 import logging
+import time
 from dataclasses import dataclass
 from datetime import datetime, timezone
 from typing import Any
@@ -36,9 +37,24 @@ logger = logging.getLogger("ta_agent.outreach_send")
 
 UNRESOLVED = ("pending", "unknown")
 
+# Gmail search indexing can lag, so a negative lookup shortly after an unknown
+# attempt is NOT proof the email was not sent. A negative result may settle an
+# attempt as failed — and so allow a new key — only when the attempt is at
+# least MIN_UNKNOWN_AGE_SECONDS old AND the lookup has been retried at least
+# twice (LOOKUP_ATTEMPTS lookups in total, spaced by LOOKUP_RETRY_DELAY_SECONDS).
+MIN_UNKNOWN_AGE_SECONDS = 300
+MIN_LOOKUPS_BEFORE_FAILED = 3     # initial lookup + at least two retries, across calls
+LOOKUP_ATTEMPTS = 3               # lookups performed per resolution pass (stops early when found)
+LOOKUP_RETRY_DELAY_SECONDS = 2.0
+
 
 class OutreachRefused(RuntimeError):
     """The send must not happen at all (opted out, no address, not configured)."""
+
+
+class OutreachUnresolved(OutreachRefused):
+    """An earlier attempt is still unresolved and too young / too little
+    retried for a negative lookup to count. No new key may be minted yet."""
 
 
 @dataclass
@@ -88,7 +104,39 @@ def prepare(application_id: str, body: str) -> tuple[str, str, str]:
     return to, body_out, opt_out_url
 
 
-def _settle(row: dict[str, Any], found: dict[str, Any] | None, *, reason: str) -> dict[str, Any]:
+def _age_seconds(row: dict[str, Any]) -> float:
+    created = row.get("created_at")
+    if isinstance(created, str):
+        created = datetime.fromisoformat(created.replace("Z", "+00:00"))
+    if created is None:
+        return 0.0
+    if created.tzinfo is None:
+        created = created.replace(tzinfo=timezone.utc)
+    return (datetime.now(timezone.utc) - created).total_seconds()
+
+
+def _lookup_with_retries(row: dict[str, Any], to: str) -> tuple[dict[str, Any] | None, int]:
+    """Look the attempt up LOOKUP_ATTEMPTS times (stop early when found).
+    Returns (found, lookups_performed)."""
+    found, performed = None, 0
+    for attempt in range(LOOKUP_ATTEMPTS):
+        found = email_service.find_sent_message(
+            message_id=row.get("message_id"), idempotency_key=row.get("idempotency_key"), to=to)
+        performed += 1
+        if found:
+            break
+        if attempt < LOOKUP_ATTEMPTS - 1 and LOOKUP_RETRY_DELAY_SECONDS > 0:
+            time.sleep(LOOKUP_RETRY_DELAY_SECONDS)
+    return found, performed
+
+
+def _resolve(row: dict[str, Any], to: str, *, reason: str) -> dict[str, Any]:
+    """One resolution pass over an unresolved attempt. Returns the row:
+    `sent` when found; `failed` when not found AND old enough AND retried
+    enough; otherwise still `unknown` (nothing may be minted yet)."""
+    found, performed = _lookup_with_retries(row, to)
+    attempts = int(row.get("resolve_attempts") or 0) + performed
+    row = repository.update_email(row["id"], {"resolve_attempts": attempts, "last_lookup_at": _now()})
     if found:
         return repository.update_email(row["id"], {
             "send_status": "sent",
@@ -97,21 +145,33 @@ def _settle(row: dict[str, Any], found: dict[str, Any] | None, *, reason: str) -
             "provider_message_id": found.get("message_id"),
             "last_error": None,
         })
+    age = _age_seconds(row)
+    if age >= MIN_UNKNOWN_AGE_SECONDS and attempts >= MIN_LOOKUPS_BEFORE_FAILED:
+        return repository.update_email(row["id"], {
+            "send_status": "failed",
+            "last_error": f"not found in mailbox after {attempts} lookups over {int(age)}s ({reason})",
+        })
     return repository.update_email(row["id"], {
-        "send_status": "failed",
-        "last_error": f"not found in mailbox ({reason})",
+        "send_status": "unknown",
+        "last_error": f"unresolved: {attempts} lookup(s), age {int(age)}s < {MIN_UNKNOWN_AGE_SECONDS}s ({reason})",
     })
 
 
 def resolve_unresolved(application_id: str, to: str) -> list[dict[str, Any]]:
     """Settle every pending/unknown attempt for the application by looking it
-    up in the mailbox. Runs BEFORE any new key may be minted."""
+    up in the mailbox. Runs BEFORE any new key may be minted. Raises
+    OutreachUnresolved when an attempt is still unknown afterwards (too young
+    or too little retried for a negative result to count)."""
     settled = []
     for row in repository.list_unresolved_sends(application_id):
-        found = email_service.find_sent_message(
-            message_id=row.get("message_id"), idempotency_key=row.get("idempotency_key"), to=to,
+        settled.append(_resolve(row, to, reason="resolution before re-approval"))
+    still = [r for r in settled if r.get("send_status") in UNRESOLVED]
+    if still:
+        r = still[0]
+        raise OutreachUnresolved(
+            f"earlier send attempt {r.get('idempotency_key')} is unresolved "
+            f"({r.get('last_error')}); retry after it is {MIN_UNKNOWN_AGE_SECONDS // 60} minutes old"
         )
-        settled.append(_settle(row, found, reason="resolution before re-approval"))
     return settled
 
 
@@ -122,11 +182,14 @@ def send_with_ledger(*, application_id: str, to: str, subject: str, body: str, k
     if existing and existing.get("send_status") == "sent":
         return SendResult(existing, "already_sent")
     if existing and existing.get("send_status") in UNRESOLVED:
-        found = email_service.find_sent_message(
-            message_id=existing.get("message_id"), idempotency_key=key, to=to)
-        row = _settle(existing, found, reason="retry of an unresolved attempt")
+        row = _resolve(existing, to, reason="retry of an unresolved attempt")
         if row.get("send_status") == "sent":
             return SendResult(row, "resolved_sent")
+        if row.get("send_status") in UNRESOLVED:
+            raise OutreachUnresolved(
+                f"send attempt {key} is unresolved ({row.get('last_error')}); "
+                f"retry after it is {MIN_UNKNOWN_AGE_SECONDS // 60} minutes old"
+            )
     elif existing:
         row = existing  # a definite failure: resend under the same key
     else:

@@ -210,3 +210,17 @@ def test_human_only_send_approval_test_fails_when_the_check_is_removed(monkeypat
         m.setattr(graph_mod, "_require_human", lambda action: None)                  # the system may approve
         _must_fail(t_send.test_system_cannot_approve_send)
     _must_pass(t_send.test_system_cannot_approve_send)
+
+
+def test_index_lag_rule_test_fails_when_the_lookup_is_not_retried(monkeypatch):
+    with monkeypatch.context() as m:
+        m.setattr(outreach_send, "LOOKUP_ATTEMPTS", 1)                                # one lookup, no retry
+        _must_fail(t_send.test_lookup_misses_then_finds_on_retry_and_nothing_is_sent_twice)
+    _must_pass(t_send.test_lookup_misses_then_finds_on_retry_and_nothing_is_sent_twice)
+
+
+def test_index_lag_rule_test_fails_when_the_age_gate_is_removed(monkeypatch):
+    with monkeypatch.context() as m:
+        m.setattr(outreach_send, "MIN_UNKNOWN_AGE_SECONDS", 0)                        # a young negative counts
+        _must_fail(t_send.test_negative_lookup_on_a_young_unknown_attempt_does_not_mint_a_new_key)
+    _must_pass(t_send.test_negative_lookup_on_a_young_unknown_attempt_does_not_mint_a_new_key)

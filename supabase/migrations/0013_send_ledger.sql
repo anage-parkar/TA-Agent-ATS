@@ -16,6 +16,8 @@ alter table emails add column if not exists message_id text;           -- the Me
 alter table emails add column if not exists provider_message_id text;  -- Gmail's own message id
 alter table emails add column if not exists send_status text;          -- pending | sent | unknown | failed
 alter table emails add column if not exists last_error text;
+alter table emails add column if not exists resolve_attempts integer not null default 0;  -- mailbox lookups so far
+alter table emails add column if not exists last_lookup_at timestamptz;
 
 alter table emails drop constraint if exists emails_send_status_check;
 alter table emails add constraint emails_send_status_check

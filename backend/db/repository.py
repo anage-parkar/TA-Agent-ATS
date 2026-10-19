@@ -638,7 +638,8 @@ def get_application_detail(application_id: str) -> Optional[dict]:
 
 
 # ── Emails ────────────────────────────────────────────────────────────
-_EMAIL_LEDGER_FIELDS = ("idempotency_key", "message_id", "provider_message_id", "send_status", "last_error")
+_EMAIL_LEDGER_FIELDS = ("idempotency_key", "message_id", "provider_message_id", "send_status", "last_error",
+                        "resolve_attempts", "last_lookup_at")
 
 
 def create_email(data: dict[str, Any]) -> dict:
@@ -657,12 +658,14 @@ def create_email(data: dict[str, Any]) -> dict:
                 insert into emails
                   (application_id, direction, subject, body, sent_at, replied_at,
                    intent, raw_reply, thread_id,
-                   idempotency_key, message_id, provider_message_id, send_status, last_error)
+                   idempotency_key, message_id, provider_message_id, send_status, last_error,
+                   resolve_attempts, last_lookup_at)
                 values
                   (%(application_id)s, %(direction)s, %(subject)s, %(body)s,
                    %(sent_at)s, %(replied_at)s, %(intent)s, %(raw_reply)s, %(thread_id)s,
                    %(idempotency_key)s, %(message_id)s, %(provider_message_id)s,
-                   %(send_status)s, %(last_error)s)
+                   %(send_status)s, %(last_error)s,
+                   coalesce(%(resolve_attempts)s, 0), %(last_lookup_at)s)
                 returning *
                 """,
                 {
