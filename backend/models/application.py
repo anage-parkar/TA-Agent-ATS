@@ -44,6 +44,16 @@ class ApplicationRecord(BaseModel):
     recruiter_decision: Optional[str] = None
 
 
+class SendApproval(BaseModel):
+    """Optional second approval carried by a combined "proceed and send" action
+    (orchestrated applications only). Recorded as its own approval."""
+
+    approve: bool = True
+    subject: str
+    body: str
+
+
 class RecruiterDecision(BaseModel):
     decision: str  # "proceed" | "reject"
     send_rejection_email: bool = False
+    send: SendApproval | None = None

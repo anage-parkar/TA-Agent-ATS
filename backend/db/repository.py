@@ -32,6 +32,10 @@ from services.tenant_context import (
 )
 
 
+class DuplicateIdempotencyKey(RuntimeError):
+    """An outbound email with this idempotency key already exists for the tenant."""
+
+
 class HumanActorRequired(RuntimeError):
     """Raised when a rejection is attempted without a bound human actor.
 
@@ -634,34 +638,83 @@ def get_application_detail(application_id: str) -> Optional[dict]:
 
 
 # ── Emails ────────────────────────────────────────────────────────────
+_EMAIL_LEDGER_FIELDS = ("idempotency_key", "message_id", "provider_message_id", "send_status", "last_error")
+
+
 def create_email(data: dict[str, Any]) -> dict:
+    key = data.get("idempotency_key")
     if not db_available():
+        if key and any(e.get("idempotency_key") == key for e in _vals(_emails)):
+            raise DuplicateIdempotencyKey(key)
         em = {"id": _new_id(), "created_at": _now(), **data}
         return _put(_emails, em)
+    import psycopg
+
     with tenant_connection() as conn:
-        cur = conn.execute(
-            """
-            insert into emails
-              (application_id, direction, subject, body, sent_at, replied_at,
-               intent, raw_reply, thread_id)
-            values
-              (%(application_id)s, %(direction)s, %(subject)s, %(body)s,
-               %(sent_at)s, %(replied_at)s, %(intent)s, %(raw_reply)s, %(thread_id)s)
-            returning *
-            """,
-            {
-                "application_id": data.get("application_id"),
-                "direction": data.get("direction"),
-                "subject": data.get("subject"),
-                "body": data.get("body"),
-                "sent_at": data.get("sent_at"),
-                "replied_at": data.get("replied_at"),
-                "intent": data.get("intent"),
-                "raw_reply": data.get("raw_reply"),
-                "thread_id": data.get("thread_id"),
-            },
-        )
+        try:
+            cur = conn.execute(
+                """
+                insert into emails
+                  (application_id, direction, subject, body, sent_at, replied_at,
+                   intent, raw_reply, thread_id,
+                   idempotency_key, message_id, provider_message_id, send_status, last_error)
+                values
+                  (%(application_id)s, %(direction)s, %(subject)s, %(body)s,
+                   %(sent_at)s, %(replied_at)s, %(intent)s, %(raw_reply)s, %(thread_id)s,
+                   %(idempotency_key)s, %(message_id)s, %(provider_message_id)s,
+                   %(send_status)s, %(last_error)s)
+                returning *
+                """,
+                {
+                    "application_id": data.get("application_id"),
+                    "direction": data.get("direction"),
+                    "subject": data.get("subject"),
+                    "body": data.get("body"),
+                    "sent_at": data.get("sent_at"),
+                    "replied_at": data.get("replied_at"),
+                    "intent": data.get("intent"),
+                    "raw_reply": data.get("raw_reply"),
+                    "thread_id": data.get("thread_id"),
+                    **{f: data.get(f) for f in _EMAIL_LEDGER_FIELDS},
+                },
+            )
+        except psycopg.errors.UniqueViolation as exc:
+            raise DuplicateIdempotencyKey(key) from exc
         return _row(cur)
+
+
+def update_email(email_id: str, fields: dict[str, Any]) -> Optional[dict]:
+    if not db_available():
+        em = _get(_emails, email_id)
+        if not em:
+            return None
+        em.update(fields)
+        return em
+    sets = ", ".join(f"{k} = %({k})s" for k in fields)
+    with tenant_connection() as conn:
+        return _row(conn.execute(
+            f"update emails set {sets} where id = %(id)s returning *", {**fields, "id": email_id}))
+
+
+def get_email_by_idempotency_key(key: str) -> Optional[dict]:
+    if not db_available():
+        return next((e for e in _vals(_emails) if e.get("idempotency_key") == key), None)
+    with tenant_connection() as conn:
+        return _row(conn.execute("select * from emails where idempotency_key = %s", (key,)))
+
+
+def list_unresolved_sends(application_id: str) -> list[dict]:
+    """Outbound attempts still pending/unknown — must be settled before a new key is minted."""
+    if not db_available():
+        return sorted(
+            [e for e in _vals(_emails) if e.get("application_id") == application_id
+             and e.get("direction") == "outbound" and e.get("send_status") in ("pending", "unknown")],
+            key=lambda e: e.get("created_at") or "",
+        )
+    with tenant_connection() as conn:
+        return _rows(conn.execute(
+            "select * from emails where application_id = %s and direction = 'outbound' "
+            "and send_status in ('pending', 'unknown') order by created_at", (application_id,)))
 
 
 def list_outbound_threads() -> list[dict]:

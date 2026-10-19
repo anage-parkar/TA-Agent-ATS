@@ -43,7 +43,9 @@ from langgraph.types import interrupt
 from db import repository
 from db.repository import HumanActorRequired
 from orchestrator.checkpointer import get_checkpointer
-from orchestrator.state import Decision, Gate, Outcome, ScoreSummary, ThreadState, ThreadStatus
+from orchestrator.state import (
+    Decision, Gate, Outcome, OutreachRef, ScoreSummary, SendStatus, ThreadState, ThreadStatus,
+)
 from services import events
 from services.tenant_context import Principal, current_user_id, is_human_principal, use_principal
 
@@ -73,11 +75,32 @@ class ResumeOriginMismatch(RuntimeError):
     def __init__(self, stale: Any, expected: dict) -> None:
         self.stale_resume_id = stale.get("resume_id") if isinstance(stale, dict) else None
         self.stale_principal = stale.get("principal") if isinstance(stale, dict) else None
+        self.kind = _classify(stale, expected)  # "stale" (earlier legitimate call) | "forged"
         super().__init__(
             f"resume value does not belong to this call: got resume_id={self.stale_resume_id!r} "
             f"principal={self.stale_principal!r}, expected resume_id={expected.get('resume_id')!r} "
             f"principal={expected.get('principal')!r}"
         )
+
+
+def _classify(envelope: Any, expected: dict) -> str:
+    """Distinguish a value parked by an EARLIER legitimate call of this tenant
+    ("stale", e.g. a worker that died before cleanup) from anything that could
+    not have been minted by the runner for this thread ("forged"): malformed
+    shape, a principal from another tenant, or this call's own resume id
+    presented with a different principal. Forged values raise a security
+    event (orchestrator.runner); stale ones are discarded and audited only."""
+    if not isinstance(envelope, dict) or set(envelope) != {"resume_id", "principal", "payload"}:
+        return "forged"
+    rid, principal = envelope.get("resume_id"), envelope.get("principal")
+    if not isinstance(rid, str) or not rid.startswith("rsm:") or not isinstance(principal, dict):
+        return "forged"
+    mine = expected.get("principal") or {}
+    if principal.get("tenant_id") != mine.get("tenant_id"):
+        return "forged"
+    if rid == expected.get("resume_id") and principal != mine:
+        return "forged"
+    return "stale"
 
 
 # Set by _node for the duration of a node: what THIS call's resume must match.
@@ -136,6 +159,15 @@ def score_application(application: dict) -> ScoreSummary:
         passed_knockouts=not knocked_out,
         below_threshold=float(score) < threshold,
     )
+
+
+# ── send port ────────────────────────────────────────────────────────────
+def send_outreach(application_id: str, *, event_id: str, subject: str, body: str):
+    """Default send port: the ledger-first send in services.outreach_send.
+    Tests inject a fake; nothing in a unit test ever reaches Gmail."""
+    from services import outreach_send
+
+    return outreach_send.send_for_application(application_id, event_id=event_id, subject=subject, body=body)
 
 
 # ── node plumbing ────────────────────────────────────────────────────────
@@ -214,8 +246,15 @@ def review_gate(state: ThreadState) -> dict[str, Any]:
     # RESUMING principal is human — the repository gate, not the graph, decides.
     repository.update_application(state.application_id, fields)
     outcome = Outcome.proceed if decision == "proceed" else Outcome.reject
+    recorded = _decision(Gate.review, outcome, resume)
+    events.emit_event(
+        "application.decided", entity_type="application", entity_id=state.application_id,
+        actor_type="human" if is_human_principal() else "system", actor_id=current_user_id(),
+        metadata={"decision": decision, "event_id": recorded.event_id,
+                  "action_group_id": resume.get("action_group_id")},
+    )
     return {
-        "decisions": [*state.decisions, _decision(Gate.review, outcome, resume)],
+        "decisions": [*state.decisions, recorded],
         "status": ThreadStatus.running if decision == "proceed" else ThreadStatus.closed,
     }
 
@@ -226,18 +265,50 @@ def _after_review(state: ThreadState) -> str:
 
 @_node
 def send_gate(state: ThreadState) -> dict[str, Any]:
-    """Human approval to send outreach. PR 2 records the approval only."""
+    """Human approval to send outreach, then the ledger-first send.
+
+    The approval is its own audited decision (`outreach.approved`). The send
+    resolves any earlier unresolved attempt BEFORE minting a key for this
+    approval; an ambiguous provider failure leaves the attempt `unknown` and
+    routes the thread back to this gate for a re-approval that will resolve
+    it first (never two emails for one approval)."""
     resume = gate_interrupt(_ref(state, "send_gate"))
     if not resume.get("approve"):
         raise ValueError("send_gate resume requires approve: true")
     _require_human("approving outreach")
+    subject, body = (resume.get("subject") or "").strip(), (resume.get("body") or "").strip()
+    if not subject or not body:
+        raise ValueError("send_gate resume requires subject and body")
     decision = _decision(Gate.send, Outcome.approve, resume)
     events.emit_event(
         "outreach.approved", entity_type="application", entity_id=state.application_id,
         actor_type="human", actor_id=current_user_id(),
-        metadata={"event_id": decision.event_id, "gate": "send_gate"},
+        metadata={"event_id": decision.event_id, "gate": "send_gate",
+                  "action_group_id": resume.get("action_group_id")},
     )
-    return {"decisions": [*state.decisions, decision], "status": ThreadStatus.running}
+    result = send_outreach(state.application_id, event_id=decision.event_id, subject=subject, body=body)
+    row = result.email
+    sent = row.get("send_status") == "sent"
+    if sent:
+        repository.update_application(state.application_id, {"stage": "Outreach"})
+    events.emit_event(
+        "outreach.sent", entity_type="application", entity_id=state.application_id,
+        actor_type="human", actor_id=current_user_id(),
+        metadata={"action": result.action, "sent": sent, "send_status": row.get("send_status"),
+                  "idempotency_key": row.get("idempotency_key"), "event_id": decision.event_id},
+    )
+    return {
+        "decisions": [*state.decisions, decision],
+        "status": ThreadStatus.running,
+        "outreach": OutreachRef(email_id=row["id"], idempotency_key=row.get("idempotency_key"),
+                                send_status=SendStatus(row.get("send_status"))),
+    }
+
+
+def _after_send(state: ThreadState) -> str:
+    """Only a confirmed send moves on; unknown/failed parks the thread at the
+    gate again, where the next approval resolves the attempt first."""
+    return "await_reply" if state.outreach.send_status == SendStatus.sent else "send_gate"
 
 
 @_node
@@ -288,7 +359,7 @@ def build_graph():
     g.add_edge("ingest", "score")
     g.add_edge("score", "review_gate")
     g.add_conditional_edges("review_gate", _after_review, {"close": "close", "send_gate": "send_gate"})
-    g.add_edge("send_gate", "await_reply")
+    g.add_conditional_edges("send_gate", _after_send, {"await_reply": "await_reply", "send_gate": "send_gate"})
     g.add_edge("await_reply", "interview_gate")
     g.add_edge("interview_gate", "scheduled")
     g.add_edge("scheduled", END)
