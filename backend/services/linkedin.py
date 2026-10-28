@@ -32,6 +32,13 @@ def _use_mock() -> bool:
     return settings.use_mock_sourcing or not settings.apify_api_token
 
 
+def _dataset_id(run) -> str:
+    # apify-client 3.x returns a Run model; older versions return a dict.
+    if isinstance(run, dict):
+        return run["defaultDatasetId"]
+    return run.default_dataset_id
+
+
 # ── Mock data ─────────────────────────────────────────────────────────
 _MOCK_JOB = """Senior Backend Engineer — Acme Robotics (Remote, US)
 
@@ -99,14 +106,16 @@ def fetch_job_post(linkedin_url: str) -> str:
     from apify_client import ApifyClient
 
     client = ApifyClient(settings.apify_api_token)
-    run = client.actor("misceres/linkedin-jobs-scraper").call(
-        run_input={"urls": [linkedin_url], "count": 1}
+    run = client.actor("johnvc/linkedin-jobs-api").call(
+        run_input={"jobUrls": [linkedin_url], "maxJobs": 1}
     )
-    items = list(client.dataset(run["defaultDatasetId"]).iterate_items())
-    if not items:
-        raise RuntimeError(f"Apify returned no data for {linkedin_url}")
-    item = items[0]
-    return item.get("descriptionText") or item.get("description") or str(item)
+    items = list(client.dataset(_dataset_id(run)).iterate_items())
+    jobs = [i for i in items if not i.get("error_message")]
+    if not jobs:
+        detail = f": {items[0]['error_message']}" if items else ""
+        raise RuntimeError(f"Apify returned no data for {linkedin_url}{detail}")
+    item = jobs[0]
+    return item.get("description") or item.get("summary") or str(item)
 
 
 def source_candidates(
@@ -122,7 +131,19 @@ def source_candidates(
 
     client = ApifyClient(settings.apify_api_token)
     query = " ".join(skills[:5])
-    run = client.actor("apimaestro/linkedin-people-search").call(
-        run_input={"keywords": query, "location": location or "", "count": limit}
+    run = client.actor("johnvc/linkedin-people-search-api").call(
+        run_input={"keywords": query, "location": location or "", "maxResults": limit}
     )
-    return list(client.dataset(run["defaultDatasetId"]).iterate_items())
+    return [
+        {
+            "full_name": item.get("fullName"),
+            "linkedin_url": item.get("profileUrl"),
+            "headline": item.get("headline") or item.get("currentTitle"),
+            "location": ", ".join(
+                p for p in [item.get("locationLocality"), item.get("locationCountry")] if p
+            )
+            or None,
+        }
+        for item in client.dataset(_dataset_id(run)).iterate_items()
+        if not item.get("errorMessage")
+    ]
